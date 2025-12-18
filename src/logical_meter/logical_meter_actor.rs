@@ -373,7 +373,20 @@ impl LogicalMeterActor {
                 metric,
                 resampler: frequenz_resampling::Resampler::new(
                     self.config.resampling_interval,
-                    ResamplingFunction::Average,
+                    self.config
+                        // Look for a specific component override first
+                        .resampling_overrides
+                        .get(&metric)
+                        .cloned()
+                        // Then look for a configured default
+                        .unwrap_or_else(|| {
+                            self.config
+                                .resampling_function
+                                .clone()
+                                // Finally, default to average if no default is
+                                // configured
+                                .unwrap_or_else(|| ResamplingFunction::Average)
+                        }),
                     3,
                     self.resampler_ts,
                     false,
