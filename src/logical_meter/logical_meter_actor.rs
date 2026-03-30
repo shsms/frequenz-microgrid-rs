@@ -387,7 +387,7 @@ impl LogicalMeterActor {
                                 // configured
                                 .unwrap_or_else(|| ResamplingFunction::Average)
                         }),
-                    3,
+                    self.config.max_age_in_intervals as i32,
                     self.resampler_ts,
                     false,
                 ),

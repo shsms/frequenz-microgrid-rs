@@ -16,6 +16,9 @@ pub struct LogicalMeterConfig {
     pub(crate) resampling_function: Option<ResamplingFunction<f32, Sample<f32>>>,
     /// Resampler overrides.
     pub(crate) resampling_overrides: HashMap<Metric, ResamplingFunction<f32, Sample<f32>>>,
+    /// The maximum age of samples to be considered for resampling, in number of
+    /// intervals.
+    pub(crate) max_age_in_intervals: u32,
 }
 
 impl LogicalMeterConfig {
@@ -25,6 +28,7 @@ impl LogicalMeterConfig {
             resampling_interval,
             resampling_function: None,
             resampling_overrides: HashMap::new(),
+            max_age_in_intervals: 3,
         }
     }
 
@@ -55,6 +59,15 @@ impl LogicalMeterConfig {
         // of `metric` to avoid an unused variable warning.
         let _ = metric;
 
+        self
+    }
+
+    /// Sets the maximum age of samples to be considered for resampling, in
+    /// number of intervals.
+    ///
+    /// If not set, the default value is 3.
+    pub fn with_max_age_in_intervals(mut self, max_age_in_intervals: u32) -> Self {
+        self.max_age_in_intervals = max_age_in_intervals;
         self
     }
 }
