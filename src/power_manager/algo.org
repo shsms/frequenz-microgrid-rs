@@ -1,0 +1,150 @@
+* Shifting matryoshka
+
+** /Initial state/
+*** soc
+
+#+NAME: socs
+#+begin_src elisp
+  (let ((socs nil))
+    `((cid soc)
+      hline
+      ,@(dolist (i (number-sequence 9 1 -1) socs)
+          (push (list i (* 10 i)) socs))))
+#+end_src
+
+#+RESULTS: socs
+| cid | soc |
+|-----+-----|
+|   1 |  10 |
+|   2 |  20 |
+|   3 |  30 |
+|   4 |  40 |
+|   5 |  50 |
+|   6 |  60 |
+|   7 |  70 |
+|   8 |  80 |
+|   9 |  90 |
+
+*** sop
+
+#+NAME: sops
+#+begin_src elisp
+  (let ((sops nil))
+    `((cid sop-lower sop-upper)
+      hline
+      ,@(dolist (i (number-sequence 9 1 -1) sops)
+          (push (list i  (* i 100 -1) (min 700 (max 200 (* i 100)))) sops))))
+#+end_src
+
+#+RESULTS: sops
+| cid | sop-lower | sop-upper |
+|-----+-----------+-----------|
+|   1 |      -100 |       200 |
+|   2 |      -200 |       200 |
+|   3 |      -300 |       300 |
+|   4 |      -400 |       400 |
+|   5 |      -500 |       500 |
+|   6 |      -600 |       600 |
+|   7 |      -700 |       700 |
+|   8 |      -800 |       700 |
+|   9 |      -900 |       700 |
+
+* functions
+#+begin_src elisp
+  (defun list-from-table (key table &optional default)
+    (if-let ((items (alist-get key table)))
+        items
+      default))
+
+  (defun value-from-table (key table &optional default)
+    (if-let ((value (car (alist-get key table))))
+        (float value)
+      default))
+
+  (defun soc-alloc-3 (power bounds cids socs sops prev-allocs)
+    (let ((pending-power power)
+          (pending-lower-bound (car bounds))
+          (pending-upper-bound (cadr bounds))
+          (target-allocs nil)
+          (target-bounds nil)
+          (total-soc 0.0))
+      (dolist (cid cids)
+        (setq total-soc (+ total-soc (- 100.0 (value-from-table cid socs 0.0)))))
+      (dolist (cid cids)
+        (let* ((soc          (- 100 (value-from-table cid socs 0.0)))
+               (sop          (list-from-table cid sops '(0.0 0.0)))
+               (sop-lower (car  sop))
+               (sop-upper (cadr sop))
+
+               (upper-bound  (min (truncate (* (/ pending-upper-bound total-soc) soc))
+                                  sop-upper))
+               (lower-bound  (max (truncate (* (/ pending-lower-bound total-soc) soc))
+                                  sop-lower))
+
+               (prev-alloc   (value-from-table cid prev-allocs 0.0))
+               (raw-alloc    (truncate (* (/ pending-power total-soc) soc)))
+               (adj-alloc    (+ prev-alloc (if (< raw-alloc 0)
+                                 (max lower-bound raw-alloc)
+                               (min upper-bound raw-alloc)))))
+
+            (message
+             (format "cid: %s, soc: %s, sop: %s, prev-alloc: %s, raw-alloc: %s, adj-alloc: %s"
+                     cid soc sop prev-alloc raw-alloc adj-alloc))
+            (message "pending-power: %s, pending-bounds: %s"
+                     pending-power
+                     (list pending-lower-bound pending-upper-bound))
+            (message
+             (format "sop: %s; bounds: %s\n" sop (list lower-bound upper-bound)))
+          (if (< upper-bound lower-bound)
+              (message "not processing")
+            (setq pending-power
+                  (- pending-power
+                     (if (< raw-alloc 0)
+                         (max (- lower-bound prev-alloc) raw-alloc)
+                       (min (- upper-bound prev-alloc) raw-alloc))))
+
+            (let ((pending-upper (- pending-upper-bound upper-bound))
+                  (pending-lower (- pending-lower-bound lower-bound)))
+              (message "Adjusting pending bounds: %s, %s" pending-lower pending-upper))
+
+            (setq pending-upper-bound (- pending-upper-bound upper-bound))
+            (setq pending-lower-bound (- pending-lower-bound lower-bound))
+            (message "Adjusting pending bounds: %s, %s" pending-lower-bound pending-upper-bound)
+            
+            (push (list cid (- lower-bound adj-alloc) (- upper-bound adj-alloc)) sops)
+            (push `(,cid ,adj-alloc) target-allocs))
+          (setq total-soc (- total-soc soc))))
+      (list target-allocs sops)))
+#+end_src
+
+#+RESULTS:
+: soc-alloc-3
+
+** soc-alloc-3
+
+
+#+begin_src elisp :var socs=socs :var sops=sops
+  (pcase-let* ((`(,a1 ,b1) (soc-alloc-3 25 '(25 50) '(1 2 3) socs sops '()))
+         (`(,a2 ,b2) (soc-alloc-3 -20  '(20 50) '(1 2 3) socs b1 a1)))
+    (list a1 a2))
+
+  ;; (pcase-let* ((`(,a1 ,b1) (soc-alloc-3 -180 '(-1000 -50) '(2 3) socs sops nil))
+  ;;              (`(,a2 ,b2) (soc-alloc-3 0 '(0 200) '(2 3) socs b1 a1))
+  ;;              (`(,a3 ,b3) (soc-alloc-3 0 '(-200 200) '(2 3) socs b2 a2))
+  ;;              (`(,a4 ,b4) (soc-alloc-3 -150 '(-200 -150) '(2 3) socs b3 a3)))
+  ;;   (list a1 a2 a3 a4))
+
+#+end_src
+
+#+RESULTS:
+| (3 8.0)  | (2 8.0)  | (1 9.0)  |
+| (3 15.0) | (2 14.0) | (1 16.0) |
+
+#+begin_src elisp :var socs=socs :var sops=sops
+      (pcase-let* ((`(,allocs-level1 ,bounds-level1) (soc-alloc-3 200 '(-800 200) '(1 2 3 4) socs sops '())))
+        (message "allocs: %s, bounds: %s" allocs-level1 bounds-level1)
+        (list  bounds-level1))
+#+end_src
+
+#+RESULTS:
+| (4 -271.0 0.0) | (3 -316.0 0.0) | (2 -253.0 0.0) | (1 -160.0 0.0) | (1 -100 200) | (2 -200 200) | (3 -300 300) | (4 -400 400) | (5 -500 500) | (6 -600 600) | (7 -700 700) | (8 -800 700) | (9 -900 700) |

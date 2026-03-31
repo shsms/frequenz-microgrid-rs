@@ -22,3 +22,8 @@ mod logical_meter;
 pub use logical_meter::{Formula, FormulaSubscriber, LogicalMeterConfig, LogicalMeterHandle};
 
 pub mod metric;
+
+pub mod power_manager;
+
+mod component_pool_health_tracker;
+pub use component_pool_health_tracker::{ComponentPoolHealthTracker, ComponentPoolStatus};
