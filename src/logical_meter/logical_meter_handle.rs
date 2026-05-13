@@ -207,6 +207,7 @@ mod tests {
 
     use crate::{
         LogicalMeterConfig, LogicalMeterHandle, MicrogridClientHandle, Sample,
+        backoff::BackoffConfig,
         client::test_utils::{
             MockComponent,
             MockMicrogridApiClient, //
@@ -267,8 +268,21 @@ mod tests {
         );
 
         let clock = api_client.clock();
+        // Pin the reconnect schedule so formula-sample assertions stay
+        // deterministic across runs (jitter would otherwise shift the
+        // moment a closed stream reconnects).
+        let client = MicrogridClientHandle::new_from_client_with_backoff_config(
+            api_client,
+            BackoffConfig::try_new(
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(3),
+                1.0,
+                0.0,
+            )
+            .unwrap(),
+        );
         LogicalMeterHandle::try_new_with_clock(
-            MicrogridClientHandle::new_from_client(api_client),
+            client,
             config.unwrap_or_else(|| LogicalMeterConfig::new(TimeDelta::try_seconds(1).unwrap())),
             clock,
         )

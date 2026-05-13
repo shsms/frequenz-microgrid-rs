@@ -22,6 +22,7 @@ use crate::{
         microgrid::microgrid_client::MicrogridClient,
     },
     metric::Metric,
+    backoff::BackoffConfig,
 };
 
 use super::{instruction::Instruction, microgrid_client_actor::MicrogridClientActor};
@@ -58,8 +59,22 @@ impl MicrogridClientHandle {
     }
 
     pub fn new_from_client(client: impl MicrogridApiClient) -> Self {
+        Self::new_from_client_with_backoff_config(client, BackoffConfig::default())
+    }
+
+    /// Like [`Self::new_from_client`], but uses the given [`BackoffConfig`] for
+    /// the per-component telemetry-stream reconnect backoff. Useful when the
+    /// caller wants a different schedule than the default (1s → 30s
+    /// exponential with ±25% jitter), or when tests need a deterministic
+    /// schedule.
+    pub fn new_from_client_with_backoff_config(
+        client: impl MicrogridApiClient,
+        backoff_config: BackoffConfig,
+    ) -> Self {
         let (instructions_tx, instructions_rx) = mpsc::channel(100);
-        tokio::spawn(MicrogridClientActor::new_from_client(client, instructions_rx).run());
+        tokio::spawn(
+            MicrogridClientActor::new_from_client(client, instructions_rx, backoff_config).run(),
+        );
         Self { instructions_tx }
     }
 
@@ -246,6 +261,7 @@ mod tests {
             microgrid::electrical_components::ElectricalComponentCategory,
         },
         client::test_utils::{MockComponent, MockMicrogridApiClient},
+        backoff::BackoffConfig,
     };
 
     fn new_client_handle() -> MicrogridClientHandle {
@@ -273,7 +289,18 @@ mod tests {
             ]),
         );
 
-        MicrogridClientHandle::new_from_client(api_client)
+        // Pin the reconnect schedule so the timing assertions in
+        // `test_receive_component_telemetry_stream` stay deterministic.
+        MicrogridClientHandle::new_from_client_with_backoff_config(
+            api_client,
+            BackoffConfig::try_new(
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(3),
+                1.0,
+                0.0,
+            )
+            .unwrap(),
+        )
     }
 
     #[tokio::test]

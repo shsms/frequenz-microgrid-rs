@@ -3,7 +3,6 @@
 
 //! The microgrid client actor that handles communication with the microgrid API.
 
-use crate::backoff::{Backoff, BackoffConfig};
 use crate::client::{
     MicrogridApiClient,
     instruction::Instruction,
@@ -14,6 +13,7 @@ use crate::client::{
         ReceiveElectricalComponentTelemetryStreamResponse,
     },
 };
+use crate::backoff::{BackoffConfig, Backoff};
 use chrono::DateTime;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
@@ -39,13 +39,19 @@ enum StreamStatus {
 pub(super) struct MicrogridClientActor<T> {
     client: T,
     instructions_rx: mpsc::Receiver<Instruction>,
+    backoff_config: BackoffConfig,
 }
 
 impl<T: MicrogridApiClient> MicrogridClientActor<T> {
-    pub(super) fn new_from_client(client: T, instructions_rx: mpsc::Receiver<Instruction>) -> Self {
+    pub(super) fn new_from_client(
+        client: T,
+        instructions_rx: mpsc::Receiver<Instruction>,
+        backoff_config: BackoffConfig,
+    ) -> Self {
         Self {
             client,
             instructions_rx,
+            backoff_config,
         }
     }
 
@@ -57,6 +63,7 @@ impl<T: MicrogridApiClient> MicrogridClientActor<T> {
         let mut retry_timer = tokio::time::interval(std::time::Duration::from_secs(1));
         retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut components_to_retry: HashMap<u64, Backoff> = HashMap::new();
+        let backoff_config = self.backoff_config;
 
         loop {
             select! {
@@ -74,7 +81,7 @@ impl<T: MicrogridApiClient> MicrogridClientActor<T> {
                     match stream_status {
                         Some(StreamStatus::Failed(component_id)) => {
                             components_to_retry.entry(component_id)
-                                .or_insert_with(|| Backoff::new(BackoffConfig::default()))
+                                .or_insert_with(|| Backoff::new(backoff_config))
                                 .next_retry_time();
                         }
                         Some(StreamStatus::Connected(component_id)) => {
