@@ -1,6 +1,7 @@
 // License: MIT
 // Copyright © 2025 Frequenz Energy-as-a-Service GmbH
 
+use crate::backoff::{Backoff, BackoffConfig};
 use crate::logical_meter::formula::Formula;
 use crate::logical_meter::formula::graph_formula_provider::GraphFormulaProvider;
 use crate::{
@@ -13,7 +14,6 @@ use crate::{
 };
 use frequenz_microgrid_component_graph::{self, ComponentGraph, ComponentGraphConfig};
 use std::collections::BTreeSet;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::{LogicalMeterConfig, logical_meter_actor::LogicalMeterActor};
@@ -29,9 +29,10 @@ impl LogicalMeterHandle {
     /// Creates a new LogicalMeter instance.
     ///
     /// Listing the components and connections from the API and building the
-    /// component graph is retried indefinitely with a 3 second backoff, so
-    /// this call blocks until the server is reachable and returns data that
-    /// forms a valid graph.  Returns an error only if `config` is invalid.
+    /// component graph is retried indefinitely with bounded exponential
+    /// backoff and jitter (see [`BackoffConfig`]), so this call blocks until
+    /// the server is reachable and returns data that forms a valid graph.
+    /// Returns an error only if `config` is invalid.
     pub async fn try_new(
         client: MicrogridClientHandle,
         config: LogicalMeterConfig,
@@ -45,16 +46,17 @@ impl LogicalMeterHandle {
         clock: C,
     ) -> Result<Self, Error> {
         let (sender, receiver) = mpsc::channel(8);
-        const RETRY_DELAY: Duration = Duration::from_secs(3);
+        let mut backoff = Backoff::new(BackoffConfig::default());
         let graph = loop {
             match build_component_graph(&client, &config.component_graph_config).await {
                 Ok(g) => break g,
                 Err(reason) => {
+                    let retry_at = backoff.next_retry_time();
+                    let delay = retry_at.duration_since(tokio::time::Instant::now());
                     tracing::warn!(
-                        "Microgrid logical-meter setup failed, retrying in {:?}: {reason}",
-                        RETRY_DELAY
+                        "Microgrid logical-meter setup failed, retrying in {delay:?}: {reason}",
                     );
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    tokio::time::sleep_until(retry_at).await;
                 }
             }
         };
