@@ -3,6 +3,7 @@
 
 //! The microgrid client actor that handles communication with the microgrid API.
 
+use crate::backoff::{Backoff, BackoffConfig};
 use crate::client::{
     MicrogridApiClient,
     instruction::Instruction,
@@ -12,7 +13,6 @@ use crate::client::{
         ReceiveElectricalComponentTelemetryStreamRequest,
         ReceiveElectricalComponentTelemetryStreamResponse,
     },
-    retry_tracker::RetryTracker,
 };
 use chrono::DateTime;
 use futures::{Stream, StreamExt};
@@ -56,7 +56,7 @@ impl<T: MicrogridApiClient> MicrogridClientActor<T> {
         let (stream_status_tx, mut stream_status_rx) = mpsc::channel(50);
         let mut retry_timer = tokio::time::interval(std::time::Duration::from_secs(1));
         retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut components_to_retry = HashMap::new();
+        let mut components_to_retry: HashMap<u64, Backoff> = HashMap::new();
 
         loop {
             select! {
@@ -73,9 +73,9 @@ impl<T: MicrogridApiClient> MicrogridClientActor<T> {
                 stream_status = stream_status_rx.recv() => {
                     match stream_status {
                         Some(StreamStatus::Failed(component_id)) => {
-                            components_to_retry.entry(component_id).or_insert_with(
-                                 RetryTracker::new
-                            ).mark_new_failure();
+                            components_to_retry.entry(component_id)
+                                .or_insert_with(|| Backoff::new(BackoffConfig::default()))
+                                .next_retry_time();
                         }
                         Some(StreamStatus::Connected(component_id)) => {
                             components_to_retry.remove(&component_id);
@@ -241,31 +241,29 @@ async fn handle_instruction<T: MicrogridApiClient>(
 async fn handle_retry_timer<T: MicrogridApiClient>(
     client: &mut T,
     component_streams: &mut HashMap<u64, broadcast::Sender<ElectricalComponentTelemetry>>,
-    components_to_retry: &mut HashMap<u64, RetryTracker>,
+    components_to_retry: &mut HashMap<u64, Backoff>,
     stream_status_tx: mpsc::Sender<StreamStatus>,
     now: tokio::time::Instant,
 ) -> Result<(), Error> {
-    for item in components_to_retry.iter_mut() {
-        if let Some(retry_time) = item.1.next_retry_time() {
-            if retry_time > now {
-                continue;
-            }
-            item.1.mark_new_retry();
-            let (component_id, _) = item;
-            if let Some(tx) = component_streams.get(component_id).cloned() {
-                start_electrical_component_telemetry_stream(
-                    client,
-                    *component_id,
-                    tx,
-                    stream_status_tx.clone(),
-                )
-                .await;
-            } else {
-                tracing::error!("Component stream not found for retry: {component_id}");
-                return Err(Error::internal(format!(
-                    "Component stream not found for retry: {component_id}"
-                )));
-            }
+    for (component_id, backoff) in components_to_retry.iter_mut() {
+        // `take_due` clears the pending retry so the next timer tick doesn't
+        // re-fire it before the stream-status loop reports the outcome.
+        if !backoff.take_due(now) {
+            continue;
+        }
+        if let Some(tx) = component_streams.get(component_id).cloned() {
+            start_electrical_component_telemetry_stream(
+                client,
+                *component_id,
+                tx,
+                stream_status_tx.clone(),
+            )
+            .await;
+        } else {
+            tracing::error!("Component stream not found for retry: {component_id}");
+            return Err(Error::internal(format!(
+                "Component stream not found for retry: {component_id}"
+            )));
         }
     }
     Ok(())

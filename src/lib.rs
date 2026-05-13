@@ -35,6 +35,8 @@ pub mod metric;
 
 pub(crate) mod wall_clock_timer;
 
+mod backoff;
+
 mod microgrid;
 pub use microgrid::{BatteryPool, Microgrid};
 
