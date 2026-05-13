@@ -1,7 +1,7 @@
 // License: MIT
 // Copyright © 2026 Frequenz Energy-as-a-Service GmbH
 
-//! Bounded exponential backoff for retry loops.
+//! Bounded exponential backoff with jitter for retry loops.
 //!
 //! - [`BackoffConfig`] is the validated configuration.
 //! - [`Backoff::next_retry_time`] records a failure and returns the
@@ -58,8 +58,7 @@ impl BackoffConfig {
     ///
     /// - `initial` and `max` must be `> 0` and `initial <= max`.
     /// - `multiplier` must be finite and `>= 1.0`.
-    /// - `jitter` must be finite and in `[0.0, 1.0]`. Jitter is not applied
-    ///   to the schedule yet; the value is stored for future use.
+    /// - `jitter` must be finite and in `[0.0, 1.0]`.
     pub fn try_new(
         initial: Duration,
         max: Duration,
@@ -113,7 +112,7 @@ impl Default for BackoffConfig {
     }
 }
 
-/// A bounded-exponential backoff.
+/// A bounded-exponential-with-jitter backoff.
 ///
 /// Pattern:
 /// - On failure, call [`Self::next_retry_time`] to record the failure and
@@ -127,14 +126,20 @@ pub struct Backoff {
     config: BackoffConfig,
     current_delay: Option<Duration>,
     deadline: Option<tokio::time::Instant>,
+    rng: fastrand::Rng,
 }
 
 impl Backoff {
     pub fn new(config: BackoffConfig) -> Self {
+        Self::with_rng(config, fastrand::Rng::new())
+    }
+
+    fn with_rng(config: BackoffConfig, rng: fastrand::Rng) -> Self {
         Self {
             config,
             current_delay: None,
             deadline: None,
+            rng,
         }
     }
 
@@ -146,7 +151,8 @@ impl Backoff {
             Some(d) => d.mul_f32(self.config.multiplier).min(self.config.max),
         };
         self.current_delay = Some(nominal);
-        let when = tokio::time::Instant::now() + nominal;
+        let factor = 1.0 + (self.rng.f32() - 0.5) * 2.0 * self.config.jitter;
+        let when = tokio::time::Instant::now() + nominal.mul_f32(factor);
         self.deadline = Some(when);
         when
     }
@@ -171,7 +177,8 @@ impl Backoff {
     }
 
     /// Clears any pending retry and resets the schedule. The next
-    /// [`Self::next_retry_time`] returns `Instant::now() + config.initial`.
+    /// [`Self::next_retry_time`] returns
+    /// `Instant::now() + config.initial * (1 ± jitter)`.
     pub fn reset(&mut self) {
         self.current_delay = None;
         self.deadline = None;
@@ -273,5 +280,45 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(backoff.take_due(tokio::time::Instant::now()));
         assert_eq!(backoff.deadline(), None);
+    }
+
+    /// With `jitter = 0.25`, each scheduled delay must fall within ±25% of
+    /// the nominal exponential value.
+    #[tokio::test(start_paused = true)]
+    async fn jitter_stays_within_configured_band() {
+        let config =
+            BackoffConfig::try_new(Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.25)
+                .unwrap();
+        for seed in 0..32u64 {
+            let mut backoff = Backoff::with_rng(config, fastrand::Rng::with_seed(seed));
+            let start = tokio::time::Instant::now();
+            for nominal in [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+            ] {
+                let when = backoff.next_retry_time();
+                let actual = when.duration_since(start);
+                assert!(
+                    actual >= nominal.mul_f32(0.75) && actual <= nominal.mul_f32(1.25),
+                    "seed {seed}: jittered delay {actual:?} outside ±25% of {nominal:?}"
+                );
+            }
+        }
+    }
+
+    /// Distinct seeds yield distinct jittered schedules — jitter actually
+    /// decorrelates concurrent retrying clients.
+    #[tokio::test(start_paused = true)]
+    async fn jitter_decorrelates_distinct_seeds() {
+        let config =
+            BackoffConfig::try_new(Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.25)
+                .unwrap();
+        let mut a = Backoff::with_rng(config, fastrand::Rng::with_seed(1));
+        let mut b = Backoff::with_rng(config, fastrand::Rng::with_seed(2));
+        assert_ne!(a.next_retry_time(), b.next_retry_time());
     }
 }
