@@ -12,9 +12,8 @@ use frequenz_microgrid_component_graph::ComponentGraph;
 
 use crate::{
     Error, LogicalMeterHandle, MicrogridClientHandle,
-    client::proto::common::microgrid::electrical_components::{
-        ElectricalComponent, ElectricalComponentConnection, ElectricalComponentStateCode,
-    },
+    client::proto::common::microgrid::electrical_components::ElectricalComponentStateCode,
+    client::proto::{GraphComponent, GraphConnection},
     microgrid::caching_sender::CachingSender,
     microgrid::telemetry_tracker::component_partition::ComponentHealthPartition,
     microgrid::telemetry_tracker::inverter_battery_group_telemetry_tracker::{
@@ -89,7 +88,7 @@ impl BatteryPoolTelemetryTracker {
     /// An empty `component_ids` set is a valid (empty) pool: the loop visits no
     /// batteries and yields no groups.
     pub(crate) fn inverter_battery_groups(
-        graph: &ComponentGraph<ElectricalComponent, ElectricalComponentConnection>,
+        graph: &ComponentGraph<GraphComponent, GraphConnection>,
         component_ids: &BTreeSet<u64>,
     ) -> Result<Vec<InverterBatteryGroup>, Error> {
         let mut unvisited_batteries = component_ids.clone();

@@ -13,14 +13,13 @@ path = "src/lib.rs"
 [dependencies]
 async-trait = "0.1.89"
 chrono = "0.4"
+frequenz-api-microgrid = { path = "../microgrid-api-rs", features = ["compile-well-known-types"] }
 frequenz-microgrid-component-graph = "0.6.0"
 frequenz-microgrid-formula-engine = "0.1.0"
 frequenz-resampling = "0.2"
 futures = "0.3.31"
-prost = "0.14"
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread"] }
 tonic = "0.14"
-tonic-prost = "0.14"
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
 tokio-stream = { version = "0.1.17", features = ["sync"], optional = true }
@@ -29,9 +28,6 @@ tokio-stream = { version = "0.1.17", features = ["sync"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["std", "env-filter"] }
 tokio = { version = "1.48", features = ["test-util"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-
-[build-dependencies]
-tonic-prost-build = { version = "0.14", features = ["cleanup-markdown"] }
 
 [features]
 test-utils = ["dep:tokio-stream"]

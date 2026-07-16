@@ -6,6 +6,12 @@
 
 ## Upgrading
 
+- The generated API types now come from the `frequenz-api-microgrid` crate. The re-export paths under `client::proto` stay the same. The newer protos add a `SteamBoiler` component category, so an exhaustive `match` on `ElectricalComponentCategory` needs a new arm.
+
+- `LogicalMeterHandle::graph()` now returns a `ComponentGraph<GraphComponent, GraphConnection>`. The wrapper types deref to `ElectricalComponent` / `ElectricalComponentConnection`, so field access keeps working. Use `.0` to get the inner value.
+
+- The `is_inverter`, `is_pv_inverter`, `is_battery_inverter` and `is_hybrid_inverter` helpers moved from `ElectricalComponent` to `GraphComponent`. Call them on components returned by the graph, or wrap a bare component first: `GraphComponent(component).is_pv_inverter()`. They are also stricter now: a component only counts as a PV, battery, or hybrid inverter when its category is `Inverter` too. Before, only the inverter type info was checked. The helpers now agree with how the component graph classifies a component.
+
 - `BatteryPoolTelemetryTracker` and `PvPoolTelemetryTracker` are no longer public; they were an implementation detail. Use `BatteryPool::telemetry_snapshots()` / `PvPool::telemetry_snapshots()` to consume their snapshots.
 
 - `PvPoolSnapshot` now exposes a single `inverters: ComponentHealthPartition` instead of the separate `healthy_inverters` / `unhealthy_inverters` maps:

@@ -3,22 +3,11 @@
 
 //! Generated protobuf modules for the Frequenz API.
 
-// Including the generated protobuf code.
-#![allow(
-    clippy::doc_lazy_continuation,
-    clippy::module_inception,
-    dead_code,
-    clippy::enum_variant_names
-)]
-mod pb {
-    tonic::include_proto!("proto_v1_alpha18");
-}
-
 // Only export what we need
-pub use pb::frequenz::api::common::v1alpha8 as common;
-pub use pb::frequenz::api::microgrid::v1alpha18 as microgrid;
+pub use frequenz_api_microgrid::common::v1alpha8 as common;
 #[cfg(any(test, feature = "test-utils"))]
-pub use pb::google;
+pub use frequenz_api_microgrid::google;
+pub use frequenz_api_microgrid::microgrid::v1alpha18 as microgrid;
 
-mod electrical_component;
 mod graph;
+pub use graph::{GraphComponent, GraphConnection};

@@ -5,9 +5,7 @@ use crate::logical_meter::formula::Formula;
 use crate::logical_meter::formula::graph_formula_provider::GraphFormulaProvider;
 use crate::{
     client::MicrogridClientHandle,
-    client::proto::common::microgrid::electrical_components::{
-        ElectricalComponent, ElectricalComponentConnection,
-    },
+    client::proto::{GraphComponent, GraphConnection},
     error::Error,
     metric,
 };
@@ -22,7 +20,7 @@ use super::{LogicalMeterConfig, logical_meter_actor::LogicalMeterActor};
 #[derive(Clone)]
 pub struct LogicalMeterHandle {
     instructions_tx: mpsc::Sender<super::logical_meter_actor::Instruction>,
-    graph: ComponentGraph<ElectricalComponent, ElectricalComponentConnection>,
+    graph: ComponentGraph<GraphComponent, GraphConnection>,
 }
 
 impl LogicalMeterHandle {
@@ -173,7 +171,7 @@ impl LogicalMeterHandle {
     }
 
     /// Returns a reference to the component graph.
-    pub fn graph(&self) -> &ComponentGraph<ElectricalComponent, ElectricalComponentConnection> {
+    pub fn graph(&self) -> &ComponentGraph<GraphComponent, GraphConnection> {
         &self.graph
     }
 }
@@ -184,7 +182,7 @@ impl LogicalMeterHandle {
 async fn build_component_graph(
     client: &MicrogridClientHandle,
     config: &ComponentGraphConfig,
-) -> Result<ComponentGraph<ElectricalComponent, ElectricalComponentConnection>, String> {
+) -> Result<ComponentGraph<GraphComponent, GraphConnection>, String> {
     let components = client
         .list_electrical_components(vec![], vec![])
         .await
@@ -193,8 +191,12 @@ async fn build_component_graph(
         .list_electrical_component_connections(vec![], vec![])
         .await
         .map_err(|e| format!("fetching component connections failed: {e}"))?;
-    ComponentGraph::try_new(components, connections, config.clone())
-        .map_err(|e| format!("building component graph failed: {e}"))
+    ComponentGraph::try_new(
+        components.into_iter().map(GraphComponent),
+        connections.into_iter().map(GraphConnection),
+        config.clone(),
+    )
+    .map_err(|e| format!("building component graph failed: {e}"))
 }
 
 #[cfg(test)]

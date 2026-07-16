@@ -5,16 +5,95 @@
 
 use tracing::{error, warn};
 
-impl frequenz_microgrid_component_graph::Node
-    for super::common::microgrid::electrical_components::ElectricalComponent
-{
+use frequenz_microgrid_component_graph as gr;
+
+use super::common::microgrid::electrical_components::{
+    ElectricalComponent, ElectricalComponentConnection,
+};
+
+/// Wrapper that implements the component graph's `Node` trait for the
+/// generated `ElectricalComponent`. The trait and the generated type both
+/// live in other crates, so the orphan rule requires a local wrapper type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphComponent(pub ElectricalComponent);
+
+impl std::ops::Deref for GraphComponent {
+    type Target = ElectricalComponent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ElectricalComponent> for GraphComponent {
+    fn from(component: ElectricalComponent) -> Self {
+        Self(component)
+    }
+}
+
+impl GraphComponent {
+    /// Returns the component's category, decoded like the component graph
+    /// sees it.
+    fn graph_category(&self) -> gr::ComponentCategory {
+        gr::Node::category(self)
+    }
+
+    /// Returns true if the component is an inverter, false otherwise.
+    pub fn is_inverter(&self) -> bool {
+        matches!(self.graph_category(), gr::ComponentCategory::Inverter(_))
+    }
+
+    /// Returns true if the component is a PV inverter, false otherwise.
+    pub fn is_pv_inverter(&self) -> bool {
+        matches!(
+            self.graph_category(),
+            gr::ComponentCategory::Inverter(gr::InverterType::Pv)
+        )
+    }
+
+    /// Returns true if the component is a battery inverter, false otherwise.
+    pub fn is_battery_inverter(&self) -> bool {
+        matches!(
+            self.graph_category(),
+            gr::ComponentCategory::Inverter(gr::InverterType::Battery)
+        )
+    }
+
+    /// Returns true if the component is a hybrid inverter, false otherwise.
+    pub fn is_hybrid_inverter(&self) -> bool {
+        matches!(
+            self.graph_category(),
+            gr::ComponentCategory::Inverter(gr::InverterType::Hybrid)
+        )
+    }
+}
+
+/// Wrapper that implements the component graph's `Edge` trait for the
+/// generated `ElectricalComponentConnection`. See [`GraphComponent`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphConnection(pub ElectricalComponentConnection);
+
+impl std::ops::Deref for GraphConnection {
+    type Target = ElectricalComponentConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ElectricalComponentConnection> for GraphConnection {
+    fn from(connection: ElectricalComponentConnection) -> Self {
+        Self(connection)
+    }
+}
+
+impl gr::Node for GraphComponent {
     fn component_id(&self) -> u64 {
         self.id
     }
 
-    fn category(&self) -> frequenz_microgrid_component_graph::ComponentCategory {
+    fn category(&self) -> gr::ComponentCategory {
         use super::common::microgrid::electrical_components as pb;
-        use frequenz_microgrid_component_graph as gr;
 
         let category =
             pb::ElectricalComponentCategory::try_from(self.category).unwrap_or_else(|e| {
@@ -121,13 +200,12 @@ impl frequenz_microgrid_component_graph::Node
             }
             pb::ElectricalComponentCategory::CapacitorBank => gr::ComponentCategory::CapacitorBank,
             pb::ElectricalComponentCategory::WindTurbine => gr::ComponentCategory::WindTurbine,
+            pb::ElectricalComponentCategory::SteamBoiler => gr::ComponentCategory::SteamBoiler,
         }
     }
 }
 
-impl frequenz_microgrid_component_graph::Edge
-    for super::common::microgrid::electrical_components::ElectricalComponentConnection
-{
+impl gr::Edge for GraphConnection {
     fn source(&self) -> u64 {
         self.source_electrical_component_id
     }

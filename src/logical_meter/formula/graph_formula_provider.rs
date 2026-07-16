@@ -4,9 +4,7 @@
 //! A composable formula type, that can be subscribed to.
 
 use crate::Error;
-use crate::client::proto::common::microgrid::electrical_components::{
-    ElectricalComponent, ElectricalComponentConnection,
-};
+use crate::client::proto::{GraphComponent, GraphConnection};
 use crate::logical_meter::formula::graph_formula::{AggregationFormula, CoalesceFormula};
 use crate::logical_meter::logical_meter_actor;
 use crate::metric::Metric;
@@ -19,7 +17,7 @@ macro_rules! graph_formula_provider {
     ($(($fnname:ident $(, ids:$idsparam:ident)? $(, id:$idparam:ident)?)),+ $(,)?) => {$(
 
         fn $fnname(
-            _graph: &ComponentGraph<ElectricalComponent, ElectricalComponentConnection>,
+            _graph: &ComponentGraph<GraphComponent, GraphConnection>,
             _instructions_tx: mpsc::Sender<logical_meter_actor::Instruction>,
             $($idsparam: Option<BTreeSet<u64>>,)?
             $($idparam: u64,)?
@@ -65,7 +63,7 @@ macro_rules! impl_graph_formula_provider {
     )),+ $(,)?) => {$(
 
         fn $fnname(
-            graph: &ComponentGraph<ElectricalComponent, ElectricalComponentConnection>,
+            graph: &ComponentGraph<GraphComponent, GraphConnection>,
             instructions_tx: mpsc::Sender<logical_meter_actor::Instruction>,
             $($idsparam: Option<BTreeSet<u64>>,)?
             $($idparam: u64,)?
