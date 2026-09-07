@@ -38,6 +38,12 @@ pub use logical_meter::{
 // component-graph crate directly.
 pub use frequenz_microgrid_component_graph::ComponentGraphConfig;
 
+// Re-exported so callers can name the type behind [`FormulaExpr`] and
+// [`Formula::expr`] without depending on the formula-engine crate directly.
+// The engine calls its expression tree `Formula`; it is re-exported as
+// `Expr` so it does not collide with this crate's [`Formula`].
+pub use frequenz_microgrid_formula_engine::Formula as Expr;
+
 pub mod metric;
 
 pub(crate) mod wall_clock_timer;
