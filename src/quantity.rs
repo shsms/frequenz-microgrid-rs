@@ -1,11 +1,9 @@
-// License: MIT
-// Copyright © 2025 Frequenz Energy-as-a-Service GmbH
+// License: MIT Copyright © 2025 Frequenz Energy-as-a-Service GmbH
 
 //! This module defines various physical quantities and their operations.
 
-/// Conversion between a quantity and its base-unit `f32`, used to move
-/// values between typed samples and the untyped formula engine.
-#[allow(dead_code)]
+/// Conversion between a quantity and its base-unit `f32`, used to move values
+/// between typed samples and the untyped formula engine.
 pub(crate) trait BaseValue: Sized {
     /// The value in the quantity's base unit (watts, volts, amperes, ...).
     fn base_value(self) -> f32;
