@@ -2,15 +2,24 @@
 
 ## Summary
 
-<!-- Here goes a general summary of what this release is about -->
+Formulas are now evaluated by the logical-meter actor against resampled snapshots, so composition no longer subscribes eagerly and can freely mix metrics.
 
 ## Upgrading
 
-<!-- Here goes notes on how to upgrade from previous versions, including deprecations and what they should be replaced with -->
+- `Formula<Q>` is now a struct wrapping a formula-engine expression; its enum variants, `FormulaOperand`, `FormulaSubscriber`, `GraphFormula`, `AggregationFormula`, `CoalesceFormula` and `GraphFormulaProvider` are gone. Composition (`coalesce`, `min`, `max`, `avg`) no longer returns `Result`: drop the `?`.
+- `Metric::FormulaType` is replaced by `Metric::FORMULA_KIND: FormulaKind`.
+- `Formula`'s `Display` output changed: the `METRIC_X::(...)` wrapper around the whole formula is gone, every component leaf now carries its metric, e.g. `#2:AC_POWER_ACTIVE`, an operand is parenthesised only where precedence or left associativity requires it, and `0.0` renders as `0`.
+- `ErrorKind::DroppedUnusedFormulas` is removed; the actor no longer uses an error to drive cleanup.
+- `frequenz-microgrid-formula-engine` 0.2 is required.
 
 ## New Features
 
-<!-- Here goes the main new features and examples or instructions on how to use them -->
+- Formulas are evaluated by the logical-meter actor against one resampled snapshot per tick, so composed formulas never need timestamp synchronisation and can mix metrics.
+- The logical meter subscribes to component telemetry on demand: only components an evaluation reads are subscribed, `COALESCE` fallbacks stay unsubscribed while the primary delivers, and a component no formula reads is dropped on the third consecutive such tick, configurable with `LogicalMeterConfig::with_unsubscribe_after_intervals`.
+- `quantity::ApparentPower` and `metric::AcPowerApparent`.
+- `Formula<Q> * Percentage` scales a formula by a percentage.
+- `Key` names the leaf of a formula expression: one metric of one component.
+- `test-utils`: `MockMicrogridApiClient::open_telemetry_streams()` reports which components have an open telemetry stream.
 
 ## Bug Fixes
 
