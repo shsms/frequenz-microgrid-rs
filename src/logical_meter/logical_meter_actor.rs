@@ -1307,8 +1307,8 @@ mod tests {
     async fn test_only_the_primary_is_subscribed_while_it_delivers() {
         let interval = TimeDelta::try_seconds(1).unwrap();
         let (lm, open) = pv_chain_handle(
-            MockComponent::pv_inverter(4).with_power(vec![10.0; 40]),
-            MockComponent::meter(3).with_power(vec![1.0; 40]),
+            MockComponent::pv_inverter(4).with_power(vec![10.0; 400]),
+            MockComponent::meter(3).with_power(vec![1.0; 400]),
             LogicalMeterConfig::new(interval),
         )
         .await;
@@ -1329,7 +1329,7 @@ mod tests {
             MockComponent::pv_inverter(4)
                 .with_power(vec![10.0; 5])
                 .with_silence_after_metrics(),
-            MockComponent::meter(3).with_power(vec![1.0; 40]),
+            MockComponent::meter(3).with_power(vec![1.0; 400]),
             LogicalMeterConfig::new(interval),
         )
         .await;
@@ -1362,8 +1362,8 @@ mod tests {
     async fn test_subscriptions_age_out_after_the_last_subscriber_drops() {
         let interval = TimeDelta::try_seconds(1).unwrap();
         let (lm, open) = pv_chain_handle(
-            MockComponent::pv_inverter(4).with_power(vec![10.0; 40]),
-            MockComponent::meter(3).with_power(vec![1.0; 40]),
+            MockComponent::pv_inverter(4).with_power(vec![10.0; 400]),
+            MockComponent::meter(3).with_power(vec![1.0; 400]),
             LogicalMeterConfig::new(interval).with_unsubscribe_after_intervals(2),
         )
         .await;
