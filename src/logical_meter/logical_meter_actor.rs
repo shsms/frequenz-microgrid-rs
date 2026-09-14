@@ -15,6 +15,7 @@ use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::client::proto::common::metrics::metric_value_variant::MetricValueVariant;
+use crate::health::{Health, health};
 use crate::logical_meter::formula::{FormulaExpr, Key, Source};
 use crate::wall_clock_timer::{Clock, WallClockTimer};
 use crate::{
@@ -54,6 +55,21 @@ struct ComponentDataResampler {
     receiver: Option<broadcast::Receiver<ElectricalComponentTelemetry>>,
     /// Consecutive ticks on which no formula read this component.
     idle_ticks: u32,
+    /// Whether the component's latest telemetry reported a healthy state.
+    /// Set from every message that carries a state snapshot. While
+    /// `false`, the key reads `None` whatever the resampler holds.
+    healthy: bool,
+    /// The unknown state code last warned about; `None` once a known code
+    /// was seen.
+    unknown_state_code: Option<i32>,
+}
+
+impl ComponentDataResampler {
+    /// The next buffered telemetry message; `None` while the subscription
+    /// is pending, or when the channel is empty or closed.
+    fn next_message(&mut self) -> Option<ElectricalComponentTelemetry> {
+        poll_telemetry(self.receiver.as_mut()?, self.key.component_id)
+    }
 }
 
 /// An in-flight telemetry subscription, yielding the key it was started
@@ -260,15 +276,17 @@ impl<C: Clock> LogicalMeterActor<C> {
     /// An entry whose telemetry subscription is still in flight is left out
     /// of the snapshot, so its key reads as [`Reading::Unknown`]. Its
     /// resampler is still advanced: one that falls behind returns several
-    /// values on its next call.
+    /// values on its next call. An entry whose latest message was unhealthy
+    /// contributes `None`.
     fn resample(
         &self,
         resamplers: &mut HashMap<Key, ComponentDataResampler>,
     ) -> Result<HashMap<Key, Option<f32>>, Error> {
         let mut snapshot = HashMap::with_capacity(resamplers.len());
         for (key, entry) in resamplers.iter_mut() {
-            if let Some(receiver) = entry.receiver.as_mut() {
-                while let Some(data) = poll_telemetry(receiver, key.component_id) {
+            while let Some(data) = entry.next_message() {
+                self.judge_health(entry, &data);
+                if entry.healthy {
                     Self::push_to_resampler(&mut entry.resampler, *key, data);
                 }
             }
@@ -280,10 +298,49 @@ impl<C: Clock> LogicalMeterActor<C> {
                 )));
             }
             if entry.receiver.is_some() {
-                snapshot.insert(*key, resampled[0].clone().value());
+                let value = entry
+                    .healthy
+                    .then(|| resampled[0].clone().value())
+                    .flatten();
+                snapshot.insert(*key, value);
             }
         }
         Ok(snapshot)
+    }
+
+    /// Sets `entry`'s health flag from one telemetry message. A message
+    /// carrying no state snapshot says nothing about health and leaves the
+    /// flag as it stands. An unknown state code is logged once per
+    /// consecutive run of the same code.
+    fn judge_health(
+        &self,
+        entry: &mut ComponentDataResampler,
+        data: &ElectricalComponentTelemetry,
+    ) {
+        if data.state_snapshots.is_empty() {
+            return;
+        }
+        entry.healthy = match health(data, &self.config.healthy_state_codes) {
+            Health::Healthy => {
+                entry.unknown_state_code = None;
+                true
+            }
+            Health::Unhealthy => {
+                entry.unknown_state_code = None;
+                false
+            }
+            Health::UnknownStateCode(code) => {
+                if entry.unknown_state_code != Some(code) {
+                    tracing::warn!(
+                        component_id = entry.key.component_id,
+                        code,
+                        "Component reports an unknown state code"
+                    );
+                }
+                entry.unknown_state_code = Some(code);
+                false
+            }
+        };
     }
 
     /// Evaluates every formula against `snapshot` and sends the results.
@@ -365,6 +422,8 @@ impl<C: Clock> LogicalMeterActor<C> {
                     resampler: self.build_resampler(*key, self.resampler_ts),
                     receiver: None,
                     idle_ticks: 0,
+                    healthy: true,
+                    unknown_state_code: None,
                 },
             );
             tracing::debug!("Subscribing to {key}");
@@ -443,21 +502,22 @@ impl<C: Clock> LogicalMeterActor<C> {
 
     /// Rebuilds every inner `frequenz_resampling::Resampler` with `start`
     /// set to the given boundary, preserving each one's telemetry broadcast
-    /// receiver. Buffered telemetry from the jumped-over window is drained
-    /// and discarded (including `Lagged` errors from the broadcast receiver,
-    /// which can happen when the server bursts enough samples during the
-    /// jump to fill the channel).
+    /// receiver. Buffered telemetry from the jumped-over window is judged
+    /// for health and its samples discarded (including `Lagged` errors from
+    /// the broadcast receiver, which can happen when the server bursts
+    /// enough samples during the jump to fill the channel).
     fn rebuild_resamplers_after_jump(
         &self,
         resamplers: &mut HashMap<Key, ComponentDataResampler>,
         start: DateTime<Utc>,
     ) {
         for entry in resamplers.values_mut() {
-            // Drain any samples that were queued during the jump window;
-            // they are timestamped on the old wall-clock frame and would
-            // pollute the freshly-aligned resampler.
-            if let Some(receiver) = entry.receiver.as_mut() {
-                while poll_telemetry(receiver, entry.key.component_id).is_some() {}
+            // The samples queued during the jump window are timestamped on
+            // the old wall-clock frame and would pollute the freshly-aligned
+            // resampler, but the states they carry are the latest word on
+            // the component's health.
+            while let Some(data) = entry.next_message() {
+                self.judge_health(entry, &data);
             }
             entry.resampler = self.build_resampler(entry.key, start);
         }
@@ -612,6 +672,8 @@ mod tests {
             resampler: actor.build_resampler(key, start),
             receiver,
             idle_ticks: 0,
+            healthy: true,
+            unknown_state_code: None,
         }
     }
 
@@ -664,6 +726,16 @@ mod tests {
         }
     }
 
+    /// One telemetry message for `component_id` carrying metric samples
+    /// and no state snapshot.
+    fn metrics_only(component_id: u64, samples: Vec<MetricSample>) -> ElectricalComponentTelemetry {
+        ElectricalComponentTelemetry {
+            electrical_component_id: component_id,
+            metric_samples: samples,
+            state_snapshots: Vec::new(),
+        }
+    }
+
     /// Resamples `resamplers` once, returning `key`'s snapshot value.
     /// Successive calls on the same map are successive ticks.
     fn resample_once(
@@ -712,6 +784,181 @@ mod tests {
         );
 
         assert_eq!(resampled(&actor, key, vec![ready]), Some(5.0));
+    }
+
+    #[tokio::test]
+    async fn test_unhealthy_message_blanks_the_reading_on_the_same_tick() {
+        let actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let ready = telemetry(
+            2,
+            mid,
+            ElectricalComponentStateCode::Ready,
+            vec![sample(Metric::AcPowerActive, mid, 5.0, vec![])],
+        );
+        let error = telemetry(
+            2,
+            mid + TimeDelta::milliseconds(100),
+            ElectricalComponentStateCode::Error,
+            vec![sample(
+                Metric::AcPowerActive,
+                mid + TimeDelta::milliseconds(100),
+                7.0,
+                vec![],
+            )],
+        );
+
+        assert_eq!(
+            resampled(&actor, key, vec![ready.clone(), error.clone()]),
+            None,
+            "the latest message is unhealthy, so the buffered 5.0 must not be read"
+        );
+        assert_eq!(
+            resampled(&actor, key, vec![error, ready]),
+            Some(5.0),
+            "a healthy message restores the reading; the unhealthy 7.0 was never buffered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_message_without_a_state_snapshot_keeps_the_health_flag() {
+        let actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let later = mid + TimeDelta::milliseconds(100);
+        let error = telemetry(2, mid, ElectricalComponentStateCode::Error, vec![]);
+        let stateless = metrics_only(2, vec![sample(Metric::AcPowerActive, later, 5.0, vec![])]);
+
+        assert_eq!(
+            resampled(&actor, key, vec![error, stateless]),
+            None,
+            "a message carrying no state snapshot must not clear the unhealthy flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthy_state_codes_come_from_the_config() {
+        let actor = bare_actor_with(
+            LogicalMeterConfig::new(TimeDelta::try_seconds(1).unwrap())
+                .with_healthy_state_codes([ElectricalComponentStateCode::Error]),
+        );
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let message = telemetry(
+            2,
+            mid,
+            ElectricalComponentStateCode::Error,
+            vec![sample(Metric::AcPowerActive, mid, 5.0, vec![])],
+        );
+        assert_eq!(resampled(&actor, key, vec![message]), Some(5.0));
+    }
+
+    #[tokio::test]
+    async fn test_an_unhealthy_component_stays_blank_while_it_sends_nothing() {
+        let mut actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let mut resamplers = resamplers_with(
+            &actor,
+            key,
+            vec![
+                telemetry(
+                    2,
+                    mid,
+                    ElectricalComponentStateCode::Ready,
+                    vec![sample(Metric::AcPowerActive, mid, 5.0, vec![])],
+                ),
+                telemetry(2, mid, ElectricalComponentStateCode::Error, vec![]),
+            ],
+        );
+
+        assert_eq!(resample_once(&actor, key, &mut resamplers), None);
+
+        actor.resampler_ts += actor.config.resampling_interval;
+        assert_eq!(
+            resample_once(&actor, key, &mut resamplers),
+            None,
+            "no message arrived to restore health, so the 5.0 the resampler \
+             still carries across the gap must stay unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_state_code_reads_none() {
+        let actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let unknown = ElectricalComponentTelemetry {
+            electrical_component_id: 2,
+            metric_samples: vec![sample(Metric::AcPowerActive, mid, 5.0, vec![])],
+            state_snapshots: vec![ElectricalComponentStateSnapshot {
+                origin_time: Some(proto_time(mid)),
+                states: vec![9999],
+                ..Default::default()
+            }],
+        };
+
+        assert_eq!(
+            resampled(&actor, key, vec![unknown]),
+            None,
+            "a state code the crate does not know counts as unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_rebuild_after_a_jump_restores_health_on_a_healthy_message() {
+        let actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let mut resamplers = resamplers_with(
+            &actor,
+            key,
+            vec![telemetry(
+                2,
+                mid,
+                ElectricalComponentStateCode::Ready,
+                vec![],
+            )],
+        );
+        resamplers.get_mut(&key).unwrap().healthy = false;
+
+        actor.rebuild_resamplers_after_jump(
+            &mut resamplers,
+            actor.resampler_ts - actor.config.resampling_interval,
+        );
+
+        assert!(
+            resamplers[&key].healthy,
+            "the healthy message drained by the rebuild must set the health flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_rebuild_after_a_jump_blanks_on_an_unhealthy_message() {
+        let actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let mut resamplers = resamplers_with(
+            &actor,
+            key,
+            vec![telemetry(
+                2,
+                mid,
+                ElectricalComponentStateCode::Error,
+                vec![],
+            )],
+        );
+
+        actor.rebuild_resamplers_after_jump(
+            &mut resamplers,
+            actor.resampler_ts - actor.config.resampling_interval,
+        );
+
+        assert!(
+            !resamplers[&key].healthy,
+            "the unhealthy message drained by the rebuild must clear the health flag"
+        );
     }
 
     fn formula_entry(formula: &str, sinks: Vec<Box<dyn FormulaSink>>) -> FormulaEntry {
