@@ -24,16 +24,33 @@ use crate::{
 };
 
 /// What a formula leaf reads from a component.
+///
+/// Bound and health leaves resample with the last value seen, not an
+/// average; the default resampling function and its per-metric overrides
+/// apply to metric values only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     /// The value of the component's sample for the metric.
     Value(MetricPb),
+    /// The lower limit of the first bounds entry on the metric's sample.
+    /// A sample with several bounds entries is read by its first entry
+    /// only.
+    LowerBound(MetricPb),
+    /// The upper limit of the first bounds entry on the metric's sample.
+    /// A sample with several bounds entries is read by its first entry
+    /// only.
+    UpperBound(MetricPb),
+    /// 1 while the component's latest state is healthy, `None` otherwise.
+    Health,
 }
 
 impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Source::Value(metric) => f.write_str(metric_name(*metric)),
+            Source::LowerBound(metric) => write!(f, "{}.lower", metric_name(*metric)),
+            Source::UpperBound(metric) => write!(f, "{}.upper", metric_name(*metric)),
+            Source::Health => f.write_str("HEALTH"),
         }
     }
 }
@@ -250,5 +267,24 @@ mod tests {
             source: Source::Value(MetricPb::AcPowerActive),
         };
         assert_eq!(key.to_string(), "5:AC_POWER_ACTIVE");
+    }
+
+    #[test]
+    fn bound_and_health_sources_render_after_the_component() {
+        let lower = Key {
+            component_id: 5,
+            source: Source::LowerBound(MetricPb::BatterySocPct),
+        };
+        let upper = Key {
+            component_id: 5,
+            source: Source::UpperBound(MetricPb::BatterySocPct),
+        };
+        let health = Key {
+            component_id: 5,
+            source: Source::Health,
+        };
+        assert_eq!(lower.to_string(), "5:BATTERY_SOC_PCT.lower");
+        assert_eq!(upper.to_string(), "5:BATTERY_SOC_PCT.upper");
+        assert_eq!(health.to_string(), "5:HEALTH");
     }
 }

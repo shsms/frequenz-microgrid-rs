@@ -15,7 +15,7 @@ use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::client::proto::common::metrics::{
-    Metric, MetricSample, metric_value_variant::MetricValueVariant,
+    Bounds as PbBounds, Metric, MetricSample, metric_value_variant::MetricValueVariant,
 };
 use crate::health::{Health, health};
 use crate::logical_meter::formula::{FormulaExpr, Key, Source};
@@ -276,6 +276,9 @@ impl<C: Clock> LogicalMeterActor<C> {
                 .cloned()
                 .or_else(|| self.config.resampling_function.clone())
                 .unwrap_or(ResamplingFunction::Average),
+            Source::LowerBound(_) | Source::UpperBound(_) | Source::Health => {
+                ResamplingFunction::Last
+            }
         };
         frequenz_resampling::Resampler::new(
             self.config.resampling_interval,
@@ -541,7 +544,8 @@ impl<C: Clock> LogicalMeterActor<C> {
 
     /// Extracts the key's source from `data` and pushes it to the
     /// resampler. A message without the source's sample, timestamp or
-    /// value pushes nothing.
+    /// value pushes nothing; a sample whose bounds entry is missing the
+    /// limit pushes `None`. The health sample is dated at the current tick.
     fn push_to_resampler(
         &self,
         entry: &mut ComponentDataResampler,
@@ -555,10 +559,32 @@ impl<C: Clock> LogicalMeterActor<C> {
                     Some(sample_value(sample)?),
                 ))
             }),
+            Source::LowerBound(metric) => {
+                Self::bound_sample(&data, key, metric, |bounds| bounds.lower)
+            }
+            Source::UpperBound(metric) => {
+                Self::bound_sample(&data, key, metric, |bounds| bounds.upper)
+            }
+            Source::Health => Some(Sample::new(self.resampler_ts, Some(1.0))),
         };
         if let Some(sample) = sample {
             entry.resampler.push(sample);
         }
+    }
+
+    /// The `limit` of the first bounds entry on `metric`'s sample, `None`
+    /// when the sample has no entry or the entry lacks the limit.
+    fn bound_sample(
+        data: &ElectricalComponentTelemetry,
+        key: Key,
+        metric: Metric,
+        limit: impl Fn(&PbBounds) -> Option<f32>,
+    ) -> Option<Sample<f32>> {
+        let sample = Self::metric_sample(data, key, metric)?;
+        Some(Sample::new(
+            sample_time(sample)?,
+            sample.bounds.first().and_then(limit),
+        ))
     }
 
     /// The sample for `metric` in `data`, logging when there is none.
@@ -659,6 +685,13 @@ mod tests {
         Key {
             component_id,
             source: Source::Value(Metric::AcPowerActive),
+        }
+    }
+
+    fn key(component_id: u64, source: Source) -> Key {
+        Key {
+            component_id,
+            source,
         }
     }
 
@@ -820,6 +853,149 @@ mod tests {
             resampled(&actor, key, vec![valued, valueless]),
             Some(5.0),
             "a sample carrying no value is not a reading; Last keeps the earlier 5.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bound_sources_read_the_first_bounds_entry() {
+        let actor = bare_actor();
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let with_bounds = telemetry(
+            2,
+            mid,
+            ElectricalComponentStateCode::Ready,
+            vec![sample(
+                Metric::BatterySocPct,
+                mid,
+                50.0,
+                vec![(Some(10.0), Some(90.0)), (Some(0.0), Some(100.0))],
+            )],
+        );
+        let without_bounds = telemetry(
+            2,
+            mid,
+            ElectricalComponentStateCode::Ready,
+            vec![sample(Metric::BatterySocPct, mid, 50.0, vec![])],
+        );
+        let lower = key(2, Source::LowerBound(Metric::BatterySocPct));
+        let upper = key(2, Source::UpperBound(Metric::BatterySocPct));
+
+        assert_eq!(
+            resampled(&actor, lower, vec![with_bounds.clone()]),
+            Some(10.0)
+        );
+        assert_eq!(
+            resampled(&actor, upper, vec![with_bounds.clone()]),
+            Some(90.0)
+        );
+        assert_eq!(resampled(&actor, lower, vec![without_bounds.clone()]), None);
+        assert_eq!(resampled(&actor, upper, vec![without_bounds]), None);
+
+        let later = mid + TimeDelta::milliseconds(100);
+        let unbounded_later = telemetry(
+            2,
+            later,
+            ElectricalComponentStateCode::Ready,
+            vec![sample(Metric::BatterySocPct, later, 50.0, vec![])],
+        );
+        assert_eq!(
+            resampled(&actor, lower, vec![with_bounds, unbounded_later]),
+            None,
+            "a sample without a bounds entry pushes None, so Last does not keep the earlier 10.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_source_reads_one_while_healthy() {
+        let actor = bare_actor();
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let health = key(2, Source::Health);
+        let ready = telemetry(2, mid, ElectricalComponentStateCode::Ready, vec![]);
+        let error = telemetry(2, mid, ElectricalComponentStateCode::Error, vec![]);
+
+        assert_eq!(resampled(&actor, health, vec![ready.clone()]), Some(1.0));
+        assert_eq!(resampled(&actor, health, vec![ready, error]), None);
+        assert_eq!(
+            resampled(&actor, health, vec![]),
+            None,
+            "no message yet reads None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_health_sample_is_dated_at_the_tick() {
+        let actor = bare_actor();
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let health = key(2, Source::Health);
+        let stale_snapshot = telemetry(
+            2,
+            mid - TimeDelta::hours(1),
+            ElectricalComponentStateCode::Ready,
+            vec![],
+        );
+
+        assert_eq!(
+            resampled(&actor, health, vec![stale_snapshot]),
+            Some(1.0),
+            "an hour-old state snapshot must not date the health sample out of the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_fades_to_none_after_max_age_silent_ticks() {
+        let mut actor = bare_actor();
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let health = key(2, Source::Health);
+        let mut resamplers = resamplers_with(
+            &actor,
+            health,
+            vec![telemetry(
+                2,
+                mid,
+                ElectricalComponentStateCode::Ready,
+                vec![],
+            )],
+        );
+
+        assert_eq!(resample_once(&actor, health, &mut resamplers), Some(1.0));
+
+        // The sample is dated at the tick that read it, so it stays in the
+        // window until `max_age_in_intervals` ticks later.
+        for tick in 1..actor.config.max_age_in_intervals {
+            actor.resampler_ts += actor.config.resampling_interval;
+            assert_eq!(
+                resample_once(&actor, health, &mut resamplers),
+                Some(1.0),
+                "the health sample must still be in the window on tick {tick}"
+            );
+        }
+        actor.resampler_ts += actor.config.resampling_interval;
+
+        assert_eq!(
+            resample_once(&actor, health, &mut resamplers),
+            None,
+            "only a message pushes a health sample, so silence ages the last one out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_like_sources_resample_with_last() {
+        let actor = bare_actor();
+        let lower = key(2, Source::LowerBound(Metric::BatterySocPct));
+        let start = actor.resampler_ts - actor.config.resampling_interval;
+        let mut resampler = actor.build_resampler(lower, start);
+        resampler.push(Sample::new(
+            start + TimeDelta::milliseconds(200),
+            Some(10.0),
+        ));
+        resampler.push(Sample::new(
+            start + TimeDelta::milliseconds(800),
+            Some(20.0),
+        ));
+        assert_eq!(
+            resampler.resample(actor.resampler_ts)[0].clone().value(),
+            Some(20.0),
+            "a bound reads its latest value, not an average"
         );
     }
 
