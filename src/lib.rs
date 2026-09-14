@@ -30,7 +30,7 @@ pub use sample::Sample;
 
 mod logical_meter;
 pub use logical_meter::{
-    Formula, FormulaExpr, Key, LogicalMeterConfig, LogicalMeterHandle, Operand,
+    Formula, FormulaExpr, Key, LogicalMeterConfig, LogicalMeterHandle, Operand, Source,
 };
 
 // Re-exported so callers can build the config accepted by

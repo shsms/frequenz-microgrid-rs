@@ -23,20 +23,39 @@ use crate::{
     quantity::{Percentage, Quantity},
 };
 
-/// A component leaf of a formula expression: one metric of one component.
+/// What a formula leaf reads from a component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
+    /// The value of the component's sample for the metric.
+    Value(MetricPb),
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Value(metric) => f.write_str(metric_name(*metric)),
+        }
+    }
+}
+
+/// The metric's proto name without its `METRIC_` prefix.
+fn metric_name(metric: MetricPb) -> &'static str {
+    let name = metric.as_str_name();
+    name.strip_prefix("METRIC_").unwrap_or(name)
+}
+
+/// A component leaf of a formula expression: one source on one component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
-    /// The metric read from the component.
-    pub metric: MetricPb,
     /// The component's id.
     pub component_id: u64,
+    /// What is read from the component.
+    pub source: Source,
 }
 
 impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let metric = self.metric.as_str_name();
-        let metric = metric.strip_prefix("METRIC_").unwrap_or(metric);
-        write!(f, "{}:{}", self.component_id, metric)
+        write!(f, "{}:{}", self.component_id, self.source)
     }
 }
 
@@ -216,5 +235,20 @@ impl<Q: Quantity + 'static> FormulaSink for TypedSink<Q> {
         self.tx
             .send(Sample::new(timestamp, value.map(Q::from_base_value)))
             .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Key, Source};
+    use crate::client::proto::common::metrics::Metric as MetricPb;
+
+    #[test]
+    fn key_renders_component_and_source() {
+        let key = Key {
+            component_id: 5,
+            source: Source::Value(MetricPb::AcPowerActive),
+        };
+        assert_eq!(key.to_string(), "5:AC_POWER_ACTIVE");
     }
 }

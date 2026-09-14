@@ -2,7 +2,7 @@
 // Copyright © 2025 Frequenz Energy-as-a-Service GmbH
 
 use crate::client::proto::common::metrics::Metric as MetricPb;
-use crate::logical_meter::formula::{Formula, Key};
+use crate::logical_meter::formula::{Formula, Key, Source};
 use crate::metric::{FormulaKind, Metric};
 use crate::{
     client::MicrogridClientHandle,
@@ -230,8 +230,8 @@ fn tag_components(
         .parse::<EngineFormula<f32>>()
         .map_err(|e| Error::formula_engine_error(format!("Failed to parse formula: {e}")))?
         .map_components(|component_id| Key {
-            metric,
             component_id,
+            source: Source::Value(metric),
         }))
 }
 

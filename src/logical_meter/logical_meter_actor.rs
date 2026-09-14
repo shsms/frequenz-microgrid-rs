@@ -14,8 +14,8 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::client::proto::common::metrics::{Metric, metric_value_variant::MetricValueVariant};
-use crate::logical_meter::formula::{FormulaExpr, Key};
+use crate::client::proto::common::metrics::metric_value_variant::MetricValueVariant;
+use crate::logical_meter::formula::{FormulaExpr, Key, Source};
 use crate::wall_clock_timer::{Clock, WallClockTimer};
 use crate::{
     Error, MicrogridClientHandle, Sample,
@@ -228,24 +228,23 @@ impl<C: Clock> LogicalMeterActor<C> {
         }
     }
 
-    /// Builds an inner resampler for `metric` aligned to `start`. Used
-    /// by both the startup path and the post-jump rebuild path so the
-    /// two stay consistent as `LogicalMeterConfig` evolves.
+    /// Builds an inner resampler for `key` aligned to `start`. Used by
+    /// both the startup path and the post-jump rebuild path so the two
+    /// stay consistent as `LogicalMeterConfig` evolves.
     fn build_resampler(
         &self,
-        metric: Metric,
+        key: Key,
         start: DateTime<Utc>,
     ) -> frequenz_resampling::Resampler<f32, Sample<f32>> {
-        let function = self
-            .config
-            // Look for a specific metric override first
-            .resampling_overrides
-            .get(&metric)
-            .cloned()
-            // Then look for a configured default
-            .or_else(|| self.config.resampling_function.clone())
-            // Finally, default to average if no default is configured
-            .unwrap_or(ResamplingFunction::Average);
+        let function = match key.source {
+            Source::Value(metric) => self
+                .config
+                .resampling_overrides
+                .get(&metric)
+                .cloned()
+                .or_else(|| self.config.resampling_function.clone())
+                .unwrap_or(ResamplingFunction::Average),
+        };
         frequenz_resampling::Resampler::new(
             self.config.resampling_interval,
             function,
@@ -363,7 +362,7 @@ impl<C: Clock> LogicalMeterActor<C> {
                 *key,
                 ComponentDataResampler {
                     key: *key,
-                    resampler: self.build_resampler(key.metric, self.resampler_ts),
+                    resampler: self.build_resampler(*key, self.resampler_ts),
                     receiver: None,
                     idle_ticks: 0,
                 },
@@ -460,7 +459,7 @@ impl<C: Clock> LogicalMeterActor<C> {
             if let Some(receiver) = entry.receiver.as_mut() {
                 while poll_telemetry(receiver, entry.key.component_id).is_some() {}
             }
-            entry.resampler = self.build_resampler(entry.key.metric, start);
+            entry.resampler = self.build_resampler(entry.key, start);
         }
     }
 
@@ -471,7 +470,7 @@ impl<C: Clock> LogicalMeterActor<C> {
         key: Key,
         data: ElectricalComponentTelemetry,
     ) {
-        let metric = key.metric;
+        let Source::Value(metric) = key.source;
         let Some(dd) = data
             .metric_samples
             .iter()
@@ -526,6 +525,7 @@ mod tests {
 
     use crate::{
         LogicalMeterConfig, LogicalMeterHandle, MicrogridClientHandle,
+        client::proto::common::metrics::Metric,
         client::test_utils::{
             MockComponent, MockMicrogridApiClient, TokioSyncedClock, wait_for_open_streams,
         },
@@ -587,8 +587,8 @@ mod tests {
 
     fn active_power_key(component_id: u64) -> Key {
         Key {
-            metric: Metric::AcPowerActive,
             component_id,
+            source: Source::Value(Metric::AcPowerActive),
         }
     }
 
@@ -602,7 +602,7 @@ mod tests {
     ) -> ComponentDataResampler {
         ComponentDataResampler {
             key,
-            resampler: actor.build_resampler(key.metric, start),
+            resampler: actor.build_resampler(key, start),
             receiver,
             idle_ticks: 0,
         }
@@ -654,8 +654,8 @@ mod tests {
         let (live, recorded) = recording_sink();
         let ac_power = active_power_key(2);
         let dc_power = Key {
-            metric: Metric::DcPower,
             component_id: 2,
+            source: Source::Value(Metric::DcPower),
         };
         // The inverter's loss: leaf `#2` is its DC power, leaf `#3` its AC
         // power.
