@@ -523,6 +523,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
+    use crate::client::proto::common::metrics::{
+        Bounds as PbBounds, MetricSample, MetricValueVariant as PbMetricValue, SimpleMetricValue,
+    };
+    use crate::client::proto::common::microgrid::electrical_components::{
+        ElectricalComponentStateCode, ElectricalComponentStateSnapshot,
+    };
+    use crate::client::proto::google::protobuf::Timestamp;
     use crate::{
         LogicalMeterConfig, LogicalMeterHandle, MicrogridClientHandle,
         client::proto::common::metrics::Metric,
@@ -606,6 +613,105 @@ mod tests {
             receiver,
             idle_ticks: 0,
         }
+    }
+
+    fn proto_time(timestamp: DateTime<Utc>) -> Timestamp {
+        Timestamp {
+            seconds: timestamp.timestamp(),
+            nanos: timestamp.timestamp_subsec_nanos() as i32,
+        }
+    }
+
+    /// A sample of `metric` at `timestamp`, with `bounds` as
+    /// `(lower, upper)` pairs.
+    fn sample(
+        metric: Metric,
+        timestamp: DateTime<Utc>,
+        value: f32,
+        bounds: Vec<(Option<f32>, Option<f32>)>,
+    ) -> MetricSample {
+        MetricSample {
+            sample_time: Some(proto_time(timestamp)),
+            metric: metric as i32,
+            value: Some(PbMetricValue {
+                metric_value_variant: Some(MetricValueVariant::SimpleMetric(SimpleMetricValue {
+                    value,
+                })),
+            }),
+            bounds: bounds
+                .into_iter()
+                .map(|(lower, upper)| PbBounds { lower, upper })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One telemetry message for `component_id` in `state`.
+    fn telemetry(
+        component_id: u64,
+        timestamp: DateTime<Utc>,
+        state: ElectricalComponentStateCode,
+        samples: Vec<MetricSample>,
+    ) -> ElectricalComponentTelemetry {
+        ElectricalComponentTelemetry {
+            electrical_component_id: component_id,
+            metric_samples: samples,
+            state_snapshots: vec![ElectricalComponentStateSnapshot {
+                origin_time: Some(proto_time(timestamp)),
+                states: vec![state as i32],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Resamples `resamplers` once, returning `key`'s snapshot value.
+    /// Successive calls on the same map are successive ticks.
+    fn resample_once(
+        actor: &LogicalMeterActor<TokioSyncedClock>,
+        key: Key,
+        resamplers: &mut HashMap<Key, ComponentDataResampler>,
+    ) -> Option<f32> {
+        actor.resample(resamplers).unwrap()[&key]
+    }
+
+    /// A single-entry resampler map for `key`, holding `messages` unread.
+    fn resamplers_with(
+        actor: &LogicalMeterActor<TokioSyncedClock>,
+        key: Key,
+        messages: Vec<ElectricalComponentTelemetry>,
+    ) -> HashMap<Key, ComponentDataResampler> {
+        let start = actor.resampler_ts - actor.config.resampling_interval;
+        let (tx, rx) = broadcast::channel(messages.len().max(1));
+        for message in messages {
+            tx.send(message).unwrap();
+        }
+        HashMap::from([(key, entry(actor, key, start, Some(rx)))])
+    }
+
+    /// Feeds `messages` to a fresh entry for `key` and resamples once,
+    /// returning the key's snapshot value.
+    fn resampled(
+        actor: &LogicalMeterActor<TokioSyncedClock>,
+        key: Key,
+        messages: Vec<ElectricalComponentTelemetry>,
+    ) -> Option<f32> {
+        let mut resamplers = resamplers_with(actor, key, messages);
+        resample_once(actor, key, &mut resamplers)
+    }
+
+    #[tokio::test]
+    async fn test_a_healthy_message_is_read_on_the_same_tick() {
+        let actor = bare_actor();
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let ready = telemetry(
+            2,
+            mid,
+            ElectricalComponentStateCode::Ready,
+            vec![sample(Metric::AcPowerActive, mid, 5.0, vec![])],
+        );
+
+        assert_eq!(resampled(&actor, key, vec![ready]), Some(5.0));
     }
 
     fn formula_entry(formula: &str, sinks: Vec<Box<dyn FormulaSink>>) -> FormulaEntry {
