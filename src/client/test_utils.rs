@@ -39,7 +39,7 @@ use crate::{
             ReceiveElectricalComponentTelemetryStreamResponse,
         },
     },
-    quantity::{Current, Frequency, Power, ReactivePower, Voltage},
+    quantity::{Current, Energy, Frequency, Percentage, Power, ReactivePower, Voltage},
 };
 
 /// A mock implementation of the `MicrogridApiClient` trait for testing purposes.
@@ -84,6 +84,26 @@ impl Drop for OpenStreamGuard {
     }
 }
 
+/// A sample of `metric` at `ts` with a simple `value` and `bounds`.
+fn simple_sample(
+    ts: Option<protobuf::Timestamp>,
+    metric: Metric,
+    value: f32,
+    bounds: Vec<Bounds>,
+) -> MetricSample {
+    MetricSample {
+        sample_time: ts,
+        metric: metric as i32,
+        value: Some(MetricValueVariant {
+            metric_value_variant: Some(metric_value_variant::MetricValueVariant::SimpleMetric(
+                SimpleMetricValue { value },
+            )),
+        }),
+        bounds,
+        connection: None,
+    }
+}
+
 /// One row per emitted telemetry frame: `(power, reactive_power, voltage,
 /// current)`. Each field is independently optional so individual metrics
 /// can be omitted from a frame.
@@ -102,6 +122,15 @@ pub struct MockComponent {
     /// AC frequency samples, one entry per telemetry frame (parallel to
     /// `metrics`). Set via [`MockComponent::with_frequency`].
     frequency: Vec<Option<Frequency>>,
+    /// Battery SoC samples in percent, one entry per telemetry frame
+    /// (parallel to `metrics`). Set via [`MockComponent::with_soc`].
+    soc: Vec<Option<Percentage>>,
+    /// The `(lower, upper)` SoC bounds in percent attached to every SoC
+    /// sample.
+    soc_bounds: Option<(Percentage, Percentage)>,
+    /// Battery capacity samples, one entry per telemetry frame (parallel
+    /// to `metrics`). Set via [`MockComponent::with_capacity`].
+    capacity: Vec<Option<Energy>>,
     /// Overrides the state code reported in each telemetry sample. `None`
     /// defaults to `Ready`.
     state_code: Option<ElectricalComponentStateCode>,
@@ -301,6 +330,36 @@ impl MockComponent {
         self
     }
 
+    /// Sets the battery SoC samples in percent, all carrying the
+    /// `(lower, upper)` SoC bounds in percent.
+    pub fn with_soc(mut self, soc: Vec<f32>, lower: f32, upper: f32) -> Self {
+        if soc.len() > self.metrics.len() {
+            self.metrics.resize(soc.len(), (None, None, None, None));
+        }
+        self.soc = soc
+            .iter()
+            .map(|s| Some(Percentage::from_percentage(*s)))
+            .collect();
+        self.soc_bounds = Some((
+            Percentage::from_percentage(lower),
+            Percentage::from_percentage(upper),
+        ));
+        self
+    }
+
+    /// Sets the battery capacity samples in watt-hours.
+    pub fn with_capacity(mut self, capacity: Vec<f32>) -> Self {
+        if capacity.len() > self.metrics.len() {
+            self.metrics
+                .resize(capacity.len(), (None, None, None, None));
+        }
+        self.capacity = capacity
+            .iter()
+            .map(|c| Some(Energy::from_watthours(*c)))
+            .collect();
+        self
+    }
+
     /// Overrides the state code reported in each telemetry sample.
     pub fn with_state(mut self, code: ElectricalComponentStateCode) -> Self {
         self.state_code = Some(code);
@@ -478,6 +537,9 @@ impl MicrogridApiClient for MockMicrogridApiClient {
         {
             let metrics = component.metrics.clone();
             let frequency = component.frequency.clone();
+            let soc = component.soc.clone();
+            let soc_bounds = component.soc_bounds;
+            let capacity = component.capacity.clone();
             let state_code = component
                 .state_code
                 .unwrap_or(ElectricalComponentStateCode::Ready);
@@ -512,89 +574,67 @@ impl MicrogridApiClient for MockMicrogridApiClient {
                     });
                     let mut metric_samples = vec![];
                     if let Some(power) = metrics.0 {
-                        metric_samples.push(MetricSample {
-                            sample_time: ts,
-                            metric: Metric::AcPowerActive as i32,
-                            value: Some(MetricValueVariant {
-                                metric_value_variant: Some(
-                                    metric_value_variant::MetricValueVariant::SimpleMetric(
-                                        SimpleMetricValue {
-                                            value: power.as_watts(),
-                                        },
-                                    ),
-                                ),
-                            }),
-                            bounds: vec![],
-                            connection: None,
-                        });
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::AcPowerActive,
+                            power.as_watts(),
+                            vec![],
+                        ));
                     }
                     if let Some(reactive_power) = metrics.1 {
-                        metric_samples.push(MetricSample {
-                            sample_time: ts,
-                            metric: Metric::AcPowerReactive as i32,
-                            value: Some(MetricValueVariant {
-                                metric_value_variant: Some(
-                                    metric_value_variant::MetricValueVariant::SimpleMetric(
-                                        SimpleMetricValue {
-                                            value: reactive_power.as_volt_amperes_reactive(),
-                                        },
-                                    ),
-                                ),
-                            }),
-                            bounds: vec![],
-                            connection: None,
-                        });
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::AcPowerReactive,
+                            reactive_power.as_volt_amperes_reactive(),
+                            vec![],
+                        ));
                     }
                     if let Some(voltage) = metrics.2 {
-                        metric_samples.push(MetricSample {
-                            sample_time: ts,
-                            metric: Metric::AcVoltage as i32,
-                            value: Some(MetricValueVariant {
-                                metric_value_variant: Some(
-                                    metric_value_variant::MetricValueVariant::SimpleMetric(
-                                        SimpleMetricValue {
-                                            value: voltage.as_volts(),
-                                        },
-                                    ),
-                                ),
-                            }),
-                            bounds: vec![],
-                            connection: None,
-                        });
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::AcVoltage,
+                            voltage.as_volts(),
+                            vec![],
+                        ));
                     }
                     if let Some(current) = metrics.3 {
-                        metric_samples.push(MetricSample {
-                            sample_time: ts,
-                            metric: Metric::AcCurrent as i32,
-                            value: Some(MetricValueVariant {
-                                metric_value_variant: Some(
-                                    metric_value_variant::MetricValueVariant::SimpleMetric(
-                                        SimpleMetricValue {
-                                            value: current.as_amperes(),
-                                        },
-                                    ),
-                                ),
-                            }),
-                            bounds: vec![],
-                            connection: None,
-                        });
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::AcCurrent,
+                            current.as_amperes(),
+                            vec![],
+                        ));
                     }
                     if let Some(Some(frequency)) = frequency.get(frame) {
-                        metric_samples.push(MetricSample {
-                            sample_time: ts,
-                            metric: Metric::AcFrequency as i32,
-                            value: Some(MetricValueVariant {
-                                metric_value_variant: Some(
-                                    metric_value_variant::MetricValueVariant::SimpleMetric(
-                                        SimpleMetricValue {
-                                            value: frequency.as_hertz(),
-                                        },
-                                    ),
-                                ),
-                            }),
-                            bounds: vec![],
-                            connection: None,
-                        });
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::AcFrequency,
+                            frequency.as_hertz(),
+                            vec![],
+                        ));
+                    }
+                    if let Some(Some(soc)) = soc.get(frame) {
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::BatterySocPct,
+                            soc.as_percentage(),
+                            soc_bounds
+                                .map(|(lower, upper)| {
+                                    vec![Bounds {
+                                        lower: Some(lower.as_percentage()),
+                                        upper: Some(upper.as_percentage()),
+                                    }]
+                                })
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    if let Some(Some(capacity)) = capacity.get(frame) {
+                        metric_samples.push(simple_sample(
+                            ts,
+                            Metric::BatteryCapacity,
+                            capacity.as_watthours(),
+                            vec![],
+                        ));
                     }
 
                     let resp = ReceiveElectricalComponentTelemetryStreamResponse {
