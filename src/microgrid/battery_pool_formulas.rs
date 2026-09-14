@@ -33,6 +33,38 @@ pub(crate) fn usable_capacity(groups: &[InverterBatteryGroup]) -> FormulaExpr {
     sum(totals) * (contributing.clone() / contributing)
 }
 
+/// The pool's SoC in percent: each battery's SoC, normalised to its SoC
+/// bounds and clamped to 0-100 %, weighted by the battery's usable
+/// capacity.
+///
+/// `None` when no battery contributes, including when every battery's
+/// usable capacity is zero.
+#[allow(dead_code)]
+pub(crate) fn soc(groups: &[InverterBatteryGroup]) -> FormulaExpr {
+    let (numerators, denominators): (Vec<_>, Vec<_>) = per_battery(groups, |battery, gate| {
+        let usable = battery_usable(battery, gate);
+        let scaled = battery_scaled_soc(battery);
+        (
+            (usable.clone() * scaled.clone()).coalesce(constant(0.0)),
+            // A battery whose SoC is missing leaves the denominator
+            // together with the numerator.
+            (usable * present(scaled)).coalesce(constant(0.0)),
+        )
+    })
+    .unzip();
+    sum(numerators) / sum(denominators)
+}
+
+/// `(soc - lower) / max(upper - lower, 0) * 100`, clamped to 0-100 %, for
+/// one battery. `None` when the bounds are equal or inverted.
+fn battery_scaled_soc(battery: u64) -> FormulaExpr {
+    let soc = leaf(battery, Source::Value(MetricPb::BatterySocPct));
+    let lower = leaf(battery, Source::LowerBound(MetricPb::BatterySocPct));
+    ((soc - lower) / soc_span(battery) * constant(100.0))
+        .max(constant(0.0))
+        .min(constant(100.0))
+}
+
 fn leaf(component_id: u64, source: Source) -> FormulaExpr {
     Expr::Component(Key {
         component_id,
@@ -251,6 +283,127 @@ mod tests {
             value,
             Some(1600.0),
             "a non-contributing battery must not blank a contributing one"
+        );
+    }
+
+    #[test]
+    fn soc_weights_each_battery_by_its_usable_capacity() {
+        let expr = soc(&[group(&[3], &[4, 5])]);
+        let value = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(10.0), Some(90.0), Some(50.0))
+                .into_iter()
+                .chain(battery(
+                    5,
+                    Some(2000.0),
+                    Some(20.0),
+                    Some(100.0),
+                    Some(100.0),
+                ))
+                .chain([healthy(3)]),
+        );
+        // Battery 4: usable 800 Wh, scaled SoC 50 %. Battery 5: usable
+        // 1600 Wh, scaled SoC 100 %. (800 * 50 + 1600 * 100) / 2400.
+        assert!((value.unwrap() - 83.333336).abs() < 1e-3, "{value:?}");
+    }
+
+    #[test]
+    fn soc_drops_a_battery_without_soc_from_the_weights_too() {
+        let expr = soc(&[group(&[3], &[4, 5])]);
+        let value = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(10.0), Some(90.0), None)
+                .into_iter()
+                .chain(battery(
+                    5,
+                    Some(2000.0),
+                    Some(20.0),
+                    Some(100.0),
+                    Some(100.0),
+                ))
+                .chain([healthy(3)]),
+        );
+        assert_eq!(
+            value,
+            Some(100.0),
+            "battery 4 must not stay in the denominator"
+        );
+    }
+
+    #[test]
+    fn soc_clamps_a_reading_outside_the_bounds() {
+        let expr = soc(&[group(&[3], &[4])]);
+        let below = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(10.0), Some(90.0), Some(5.0))
+                .into_iter()
+                .chain([healthy(3)]),
+        );
+        let above = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(10.0), Some(90.0), Some(95.0))
+                .into_iter()
+                .chain([healthy(3)]),
+        );
+        assert_eq!(below, Some(0.0));
+        assert_eq!(above, Some(100.0));
+    }
+
+    #[test]
+    fn soc_is_none_without_a_contributing_battery() {
+        let expr = soc(&[group(&[3], &[4])]);
+        let unhealthy_inverter = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(10.0), Some(90.0), Some(50.0))
+                .into_iter()
+                .chain([unhealthy(3)]),
+        );
+        let equal_bounds = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(50.0), Some(50.0), Some(50.0))
+                .into_iter()
+                .chain([healthy(3)]),
+        );
+        assert_eq!(unhealthy_inverter, None);
+        assert_eq!(equal_bounds, None);
+        assert_eq!(evaluate(&soc(&[]), std::iter::empty()), None);
+    }
+
+    #[test]
+    fn soc_of_inverted_bounds_is_none() {
+        let expr = soc(&[group(&[3], &[4])]);
+        let value = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(90.0), Some(10.0), Some(50.0))
+                .into_iter()
+                .chain([healthy(3)]),
+        );
+        assert_eq!(
+            value, None,
+            "inverted bounds leave the only battery no weight"
+        );
+    }
+
+    #[test]
+    fn soc_ignores_a_battery_with_inverted_bounds() {
+        let expr = soc(&[group(&[3], &[4, 5])]);
+        let value = evaluate(
+            &expr,
+            battery(4, Some(1000.0), Some(10.0), Some(90.0), Some(50.0))
+                .into_iter()
+                .chain(battery(
+                    5,
+                    Some(2000.0),
+                    Some(90.0),
+                    Some(10.0),
+                    Some(100.0),
+                ))
+                .chain([healthy(3)]),
+        );
+        assert_eq!(
+            value,
+            Some(50.0),
+            "a battery with inverted bounds carries no weight into the mean"
         );
     }
 }
