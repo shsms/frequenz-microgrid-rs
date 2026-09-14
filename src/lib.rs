@@ -47,6 +47,7 @@ pub use frequenz_microgrid_formula_engine::{Formula as Expr, Function, Op};
 
 pub mod metric;
 
+pub(crate) mod health;
 pub(crate) mod wall_clock_timer;
 
 mod microgrid;
