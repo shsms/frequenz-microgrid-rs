@@ -14,7 +14,9 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::client::proto::common::metrics::metric_value_variant::MetricValueVariant;
+use crate::client::proto::common::metrics::{
+    Metric, MetricSample, metric_value_variant::MetricValueVariant,
+};
 use crate::health::{Health, health};
 use crate::logical_meter::formula::{FormulaExpr, Key, Source};
 use crate::wall_clock_timer::{Clock, WallClockTimer};
@@ -123,6 +125,20 @@ fn poll_telemetry(
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
         }
+    }
+}
+
+/// The sample's time, if it carries a valid one.
+fn sample_time(sample: &MetricSample) -> Option<DateTime<Utc>> {
+    let time = sample.sample_time?;
+    DateTime::from_timestamp(time.seconds, time.nanos as u32)
+}
+
+/// The sample's value: a simple value, or the average of an aggregated one.
+fn sample_value(sample: &MetricSample) -> Option<f32> {
+    match sample.value.as_ref()?.metric_value_variant.as_ref()? {
+        MetricValueVariant::SimpleMetric(value) => Some(value.value),
+        MetricValueVariant::AggregatedMetric(value) => Some(value.avg_value),
     }
 }
 
@@ -287,7 +303,7 @@ impl<C: Clock> LogicalMeterActor<C> {
             while let Some(data) = entry.next_message() {
                 self.judge_health(entry, &data);
                 if entry.healthy {
-                    Self::push_to_resampler(&mut entry.resampler, *key, data);
+                    self.push_to_resampler(entry, data);
                 }
             }
             let resampled = entry.resampler.resample(self.resampler_ts);
@@ -523,54 +539,42 @@ impl<C: Clock> LogicalMeterActor<C> {
         }
     }
 
-    /// Extracts the resampler's metric from the given telemetry and pushes
-    /// it to the resampler's internal buffer.
+    /// Extracts the key's source from `data` and pushes it to the
+    /// resampler. A message without the source's sample, timestamp or
+    /// value pushes nothing.
     fn push_to_resampler(
-        resampler: &mut frequenz_resampling::Resampler<f32, Sample<f32>>,
-        key: Key,
+        &self,
+        entry: &mut ComponentDataResampler,
         data: ElectricalComponentTelemetry,
     ) {
-        let Source::Value(metric) = key.source;
-        let Some(dd) = data
+        let key = entry.key;
+        let sample = match key.source {
+            Source::Value(metric) => Self::metric_sample(&data, key, metric).and_then(|sample| {
+                Some(Sample::new(
+                    sample_time(sample)?,
+                    Some(sample_value(sample)?),
+                ))
+            }),
+        };
+        if let Some(sample) = sample {
+            entry.resampler.push(sample);
+        }
+    }
+
+    /// The sample for `metric` in `data`, logging when there is none.
+    fn metric_sample(
+        data: &ElectricalComponentTelemetry,
+        key: Key,
+        metric: Metric,
+    ) -> Option<&MetricSample> {
+        let sample = data
             .metric_samples
             .iter()
-            .find(|s| s.metric == metric as i32)
-        else {
-            tracing::debug!(
-                "No data for metric {:?} in component {}",
-                metric,
-                key.component_id
-            );
-            return;
-        };
-        let timestamp = if let Some(timestamp) = dd.sample_time {
-            if let Some(timestamp) =
-                DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32)
-            {
-                timestamp
-            } else {
-                return;
-            }
-        } else {
-            return;
-        };
-
-        let value = if let Some(value) = &dd.value {
-            if let Some(value) = &value.metric_value_variant {
-                Some(match value {
-                    MetricValueVariant::SimpleMetric(value) => value.value,
-                    MetricValueVariant::AggregatedMetric(value) => value.avg_value,
-                })
-            } else {
-                return;
-            }
-        } else {
-            return;
-        };
-
-        let sample = Sample::new(timestamp, value);
-
-        resampler.push(sample);
+            .find(|s| s.metric == metric as i32);
+        if sample.is_none() {
+            tracing::debug!("No data for {key}");
+        }
+        sample
     }
 }
 
@@ -592,7 +596,6 @@ mod tests {
     use crate::client::proto::google::protobuf::Timestamp;
     use crate::{
         LogicalMeterConfig, LogicalMeterHandle, MicrogridClientHandle,
-        client::proto::common::metrics::Metric,
         client::test_utils::{
             MockComponent, MockMicrogridApiClient, TokioSyncedClock, wait_for_open_streams,
         },
@@ -784,6 +787,40 @@ mod tests {
         );
 
         assert_eq!(resampled(&actor, key, vec![ready]), Some(5.0));
+    }
+
+    #[tokio::test]
+    async fn test_a_valueless_sample_is_not_a_reading() {
+        let actor = bare_actor_with(
+            LogicalMeterConfig::new(TimeDelta::try_seconds(1).unwrap())
+                .with_default_resampling_function(ResamplingFunction::Last),
+        );
+        let key = active_power_key(2);
+        let mid = actor.resampler_ts - TimeDelta::milliseconds(500);
+        let later = mid + TimeDelta::milliseconds(100);
+        let valued = telemetry(
+            2,
+            mid,
+            ElectricalComponentStateCode::Ready,
+            vec![sample(Metric::AcPowerActive, mid, 5.0, vec![])],
+        );
+        let valueless = telemetry(
+            2,
+            later,
+            ElectricalComponentStateCode::Ready,
+            vec![MetricSample {
+                sample_time: Some(proto_time(later)),
+                metric: Metric::AcPowerActive as i32,
+                value: None,
+                ..Default::default()
+            }],
+        );
+
+        assert_eq!(
+            resampled(&actor, key, vec![valued, valueless]),
+            Some(5.0),
+            "a sample carrying no value is not a reading; Last keeps the earlier 5.0"
+        );
     }
 
     #[tokio::test]
