@@ -39,7 +39,6 @@ pub(crate) fn usable_capacity(groups: &[InverterBatteryGroup]) -> FormulaExpr {
 ///
 /// `None` when no battery contributes, including when every battery's
 /// usable capacity is zero.
-#[allow(dead_code)]
 pub(crate) fn soc(groups: &[InverterBatteryGroup]) -> FormulaExpr {
     let (numerators, denominators): (Vec<_>, Vec<_>) = per_battery(groups, |battery, gate| {
         let usable = battery_usable(battery, gate);

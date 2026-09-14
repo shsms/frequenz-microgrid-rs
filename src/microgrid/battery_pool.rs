@@ -26,7 +26,7 @@ use crate::{
             BatteryPoolSnapshot, BatteryPoolTelemetryTracker, InverterBatteryGroup,
         },
     },
-    quantity::{Energy, Power},
+    quantity::{Energy, Percentage, Power},
 };
 
 /// An interface for abstracting over a pool of batteries in the microgrid.
@@ -104,6 +104,21 @@ impl BatteryPool {
     pub fn capacity(&self) -> Formula<Energy> {
         self.logical_meter
             .formula_from_expr(battery_pool_formulas::usable_capacity(&self.groups))
+    }
+
+    /// Returns a formula for the state of charge of the pool: each
+    /// battery's SoC, normalised to its SoC bounds and clamped to 0-100 %,
+    /// weighted by the battery's usable capacity.
+    ///
+    /// A battery contributes nothing while its capacity, SoC or SoC bounds
+    /// are missing, while it is unhealthy, or while an inverter of its group
+    /// is unhealthy or has sent nothing for `max_age_in_intervals` intervals.
+    /// A battery whose bounds are equal or inverted has no weight. The
+    /// formula reads `None` when no battery contributes, and while any
+    /// component of the pool is still being subscribed.
+    pub fn soc(&self) -> Formula<Percentage> {
+        self.logical_meter
+            .formula_from_expr(battery_pool_formulas::soc(&self.groups))
     }
 
     /// Returns a receiver for the aggregated active-power bounds of the pool,
@@ -287,5 +302,22 @@ mod tests {
             "{}",
             pool.capacity()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn soc_is_weighted_by_usable_capacity() {
+        let (client, lm) = handles(soc_graph(ElectricalComponentStateCode::Ready)).await;
+        let pool = BatteryPool::try_new(None, client, lm).unwrap();
+        let sample = last_sample(pool.soc(), 4).await;
+        let soc = sample.value().map(|s| s.as_percentage()).unwrap();
+        assert!((soc - 83.333336).abs() < 1e-3, "{soc}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn soc_is_none_while_the_inverter_is_unhealthy() {
+        let (client, lm) = handles(soc_graph(ElectricalComponentStateCode::Error)).await;
+        let pool = BatteryPool::try_new(None, client, lm).unwrap();
+        let sample = last_sample(pool.soc(), 4).await;
+        assert_eq!(sample.value(), None);
     }
 }
