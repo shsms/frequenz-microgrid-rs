@@ -18,7 +18,6 @@ use crate::{Expr, FormulaExpr, Key, Source};
 /// are the battery's SoC bounds in percent.
 ///
 /// `None` when no battery contributes.
-#[allow(dead_code)]
 pub(crate) fn usable_capacity(groups: &[InverterBatteryGroup]) -> FormulaExpr {
     let (totals, flags): (Vec<_>, Vec<_>) = per_battery(groups, |battery, gate| {
         let usable = battery_usable(battery, gate);

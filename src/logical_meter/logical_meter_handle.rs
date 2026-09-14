@@ -218,6 +218,15 @@ impl LogicalMeterHandle {
     pub fn graph(&self) -> &ComponentGraph<ElectricalComponent, ElectricalComponentConnection> {
         &self.graph
     }
+
+    /// Wraps an expression built in this crate as a formula of `Q`. The
+    /// caller guarantees the expression evaluates in `Q`'s base unit.
+    pub(crate) fn formula_from_expr<Q: crate::quantity::Quantity>(
+        &self,
+        expr: crate::FormulaExpr,
+    ) -> Formula<Q> {
+        Formula::new(expr, self.instructions_tx.clone())
+    }
 }
 
 /// Parses a graph formula and tags every component leaf with `metric`.
