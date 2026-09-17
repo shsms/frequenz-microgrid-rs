@@ -18,6 +18,9 @@ pub use battery_pool::BatteryPool;
 mod pv_pool;
 pub use pv_pool::PvPool;
 
+mod steam_boiler_pool;
+pub use steam_boiler_pool::SteamBoilerPool;
+
 pub(crate) mod telemetry_tracker;
 pub use telemetry_tracker::battery_pool_telemetry_tracker::{
     BatteryPoolSnapshot, InverterBatteryGroup,
@@ -88,6 +91,17 @@ impl Microgrid {
 
     pub fn pv_pool(&self, component_ids: Option<Vec<u64>>) -> Result<PvPool, Error> {
         PvPool::try_new(
+            component_ids.map(|ids| ids.into_iter().collect()),
+            self.client.clone(),
+            self.logical_meter.clone(),
+        )
+    }
+
+    pub fn steam_boiler_pool(
+        &self,
+        component_ids: Option<Vec<u64>>,
+    ) -> Result<SteamBoilerPool, Error> {
+        SteamBoilerPool::try_new(
             component_ids.map(|ids| ids.into_iter().collect()),
             self.client.clone(),
             self.logical_meter.clone(),
