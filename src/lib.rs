@@ -44,6 +44,7 @@ mod microgrid;
 pub use microgrid::{
     BatteryPool, BatteryPoolSnapshot, ComponentHealthPartition, InverterBatteryGroup,
     InverterBatteryGroupStatus, Microgrid, PvPool, PvPoolSnapshot, SteamBoilerPool,
+    SteamBoilerPoolSnapshot,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

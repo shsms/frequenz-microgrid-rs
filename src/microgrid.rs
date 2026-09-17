@@ -28,6 +28,7 @@ pub use telemetry_tracker::battery_pool_telemetry_tracker::{
 pub use telemetry_tracker::component_partition::ComponentHealthPartition;
 pub use telemetry_tracker::inverter_battery_group_telemetry_tracker::InverterBatteryGroupStatus;
 pub use telemetry_tracker::pv_pool_telemetry_tracker::PvPoolSnapshot;
+pub use telemetry_tracker::steam_boiler_pool_telemetry_tracker::SteamBoilerPoolSnapshot;
 
 use crate::{Error, LogicalMeterConfig, LogicalMeterHandle, MicrogridClientHandle};
 
