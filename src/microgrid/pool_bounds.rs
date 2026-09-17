@@ -1,19 +1,21 @@
 // License: MIT
 // Copyright © 2026 Frequenz Energy-as-a-Service GmbH
 
-//! Pool-level bounds aggregation for PV and battery pools.
+//! Pool-level bounds aggregation for PV, steam boiler and battery pools.
 //!
 //! Each pool's healthy components have their per-metric bounds combined into a
-//! single pool-level set. PV inverters in a pool are wired in parallel, so their
-//! bounds are simply added together. A battery pool aggregates following the
-//! physical topology of its inverter-battery groups (parallel within a side,
-//! series between the inverter and battery sides, parallel across groups).
+//! single pool-level set. The PV inverters or steam boilers in a pool are wired
+//! in parallel, so their bounds are simply added together. A battery pool
+//! aggregates following the physical topology of its inverter-battery groups
+//! (parallel within a side, series between the inverter and battery sides,
+//! parallel across groups).
 
 use crate::bounds::{combine_parallel_sets, intersect_bounds_sets};
 use crate::client::proto::common::metrics::Bounds as PbBounds;
 use crate::microgrid::bounds_aggregation::aggregate_parallel;
 use crate::microgrid::telemetry_tracker::battery_pool_telemetry_tracker::BatteryPoolSnapshot;
 use crate::microgrid::telemetry_tracker::pv_pool_telemetry_tracker::PvPoolSnapshot;
+use crate::microgrid::telemetry_tracker::steam_boiler_pool_telemetry_tracker::SteamBoilerPoolSnapshot;
 use crate::{Bounds, metric::Metric};
 
 /// Aggregates the bounds of every healthy PV inverter in the pool. The
@@ -27,6 +29,21 @@ where
     Bounds<M::QuantityType>: From<PbBounds>,
 {
     aggregate_parallel::<M>(&status.inverters.healthy)
+}
+
+/// Aggregates the bounds of every healthy steam boiler in the pool. The boilers
+/// are wired in parallel, so their bounds combine in parallel.
+///
+/// `M` is the metric used to read bounds from the steam boilers (e.g.
+/// `AcPowerActive`).
+pub(crate) fn compute_steam_boiler_pool_bounds<M>(
+    status: &SteamBoilerPoolSnapshot,
+) -> Vec<Bounds<M::QuantityType>>
+where
+    M: Metric,
+    Bounds<M::QuantityType>: From<PbBounds>,
+{
+    aggregate_parallel::<M>(&status.boilers.healthy)
 }
 
 /// Aggregates the power bounds of a battery pool following the physical
@@ -182,6 +199,79 @@ mod pv_tests {
         let snap = healthy_snapshot(vec![other]);
         let bounds = compute_pool_bounds::<AcPowerActive>(&snap);
         assert!(bounds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod steam_boiler_tests {
+    use std::collections::HashMap;
+
+    use crate::Bounds;
+    use crate::client::proto::common::microgrid::electrical_components::ElectricalComponentTelemetry;
+    use crate::metric::AcPowerActive;
+    use crate::microgrid::telemetry_tracker::component_partition::ComponentHealthPartition;
+    use crate::microgrid::telemetry_tracker::steam_boiler_pool_telemetry_tracker::SteamBoilerPoolSnapshot;
+    use crate::microgrid::test_utils::telem_with_power_bounds;
+    use crate::quantity::Power;
+
+    use super::compute_steam_boiler_pool_bounds as compute_pool_bounds;
+
+    /// Builds a snapshot whose healthy set holds the given telemetry, keyed by
+    /// component ID, and an empty unhealthy set.
+    fn healthy_snapshot(healthy: Vec<ElectricalComponentTelemetry>) -> SteamBoilerPoolSnapshot {
+        let healthy = healthy
+            .into_iter()
+            .map(|t| (t.electrical_component_id, t))
+            .collect();
+        SteamBoilerPoolSnapshot {
+            boilers: ComponentHealthPartition {
+                healthy,
+                unhealthy: HashMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn parallel_boilers_add() {
+        let snap = healthy_snapshot(vec![
+            telem_with_power_bounds(10, vec![(Some(0.0), Some(1000.0))]),
+            telem_with_power_bounds(11, vec![(Some(0.0), Some(2000.0))]),
+        ]);
+        let bounds = compute_pool_bounds::<AcPowerActive>(&snap);
+        assert_eq!(
+            bounds,
+            vec![Bounds::new(
+                Some(Power::from_watts(0.0)),
+                Some(Power::from_watts(3000.0))
+            )]
+        );
+    }
+
+    /// Only healthy boilers contribute to the pool bounds; unhealthy ones are
+    /// ignored even when their last telemetry carried bounds.
+    #[test]
+    fn unhealthy_boilers_are_excluded() {
+        let healthy = [telem_with_power_bounds(10, vec![(Some(0.0), Some(1000.0))])]
+            .into_iter()
+            .map(|t| (t.electrical_component_id, t))
+            .collect();
+        let mut unhealthy = HashMap::new();
+        unhealthy.insert(
+            11,
+            Some(telem_with_power_bounds(11, vec![(Some(0.0), Some(9000.0))])),
+        );
+        let snap = SteamBoilerPoolSnapshot {
+            boilers: ComponentHealthPartition { healthy, unhealthy },
+        };
+
+        let bounds = compute_pool_bounds::<AcPowerActive>(&snap);
+        assert_eq!(
+            bounds,
+            vec![Bounds::new(
+                Some(Power::from_watts(0.0)),
+                Some(Power::from_watts(1000.0))
+            )]
+        );
     }
 }
 

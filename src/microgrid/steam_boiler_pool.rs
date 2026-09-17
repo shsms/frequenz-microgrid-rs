@@ -5,9 +5,11 @@
 //!
 //! A [`SteamBoilerPool`] aggregates a set of steam boilers — either an explicit
 //! subset or every steam boiler in the microgrid — and exposes their combined
-//! active power and a health-partitioned telemetry snapshot stream.
+//! active power, their aggregated active-power bounds, and a health-partitioned
+//! telemetry snapshot stream.
 //!
-//! Obtain one from [`Microgrid::steam_boiler_pool`].
+//! Obtain one from [`Microgrid::steam_boiler_pool`]; see [`SteamBoilerPool`]
+//! for a usage example.
 //!
 //! [`Microgrid::steam_boiler_pool`]: crate::Microgrid::steam_boiler_pool
 
@@ -17,13 +19,16 @@ use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use crate::{
-    Error, Formula, LogicalMeterHandle, MicrogridClientHandle,
+    Bounds, Error, Formula, LogicalMeterHandle, MicrogridClientHandle,
     client::proto::common::microgrid::electrical_components::{
         ElectricalComponentCategory, ElectricalComponentStateCode,
     },
     metric,
+    metric::Metric,
     microgrid::{
         caching_sender::{CachingSender, WeakCachingSender},
+        pool_bounds,
+        pool_bounds_tracker::PoolBoundsTracker,
         pool_validation::validate_pool_ids,
         telemetry_tracker::steam_boiler_pool_telemetry_tracker::{
             SteamBoilerPoolSnapshot, SteamBoilerPoolTelemetryTracker,
@@ -40,12 +45,39 @@ use crate::{
 ///
 /// - [`power`](Self::power) — a [`Formula`] for the pool's aggregate active
 ///   power;
+/// - [`power_bounds`](Self::power_bounds) — a stream of the pool's aggregated
+///   active-power bounds;
 /// - [`telemetry_snapshots`](Self::telemetry_snapshots) — a stream of
 ///   [`SteamBoilerPoolSnapshot`]s partitioning the boilers into healthy and
 ///   unhealthy sets.
 ///
-/// The snapshot stream's telemetry tracker is started on first use and reused
-/// while it still has live receivers.
+/// The bounds and snapshot streams share a telemetry tracker that is started on
+/// first use and reused while it still has live receivers.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> Result<(), frequenz_microgrid::Error> {
+/// use chrono::TimeDelta;
+/// use frequenz_microgrid::{LogicalMeterConfig, Microgrid};
+///
+/// let microgrid = Microgrid::try_new(
+///     "grpc://localhost:50051",
+///     LogicalMeterConfig::new(TimeDelta::try_seconds(1).unwrap()),
+/// )
+/// .await?;
+///
+/// // A pool over every steam boiler in the microgrid.
+/// let mut boilers = microgrid.steam_boiler_pool(None)?;
+///
+/// // Subscribe to the pool's aggregated active-power bounds.
+/// let mut bounds_rx = boilers.power_bounds();
+/// while let Ok(bounds) = bounds_rx.recv().await {
+///     println!("Steam boiler pool active-power bounds: {bounds:?}");
+/// }
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// [mg]: crate::Microgrid::steam_boiler_pool
 pub struct SteamBoilerPool {
@@ -53,6 +85,7 @@ pub struct SteamBoilerPool {
     client: MicrogridClientHandle,
     logical_meter: LogicalMeterHandle,
     snapshot_tx: Option<WeakCachingSender<SteamBoilerPoolSnapshot>>,
+    bounds_tx: Option<WeakCachingSender<Vec<Bounds<Power>>>>,
 }
 
 impl SteamBoilerPool {
@@ -72,6 +105,7 @@ impl SteamBoilerPool {
             client,
             logical_meter,
             snapshot_tx: None,
+            bounds_tx: None,
         };
         validate_pool_ids(
             &this.component_ids,
@@ -105,12 +139,40 @@ impl SteamBoilerPool {
             .steam_boiler::<metric::AcPowerActive>(self.component_ids.clone())
     }
 
+    /// Returns a receiver for the aggregated active-power bounds of the pool,
+    /// updated on each snapshot.
+    ///
+    /// Reuses the running bounds tracker if one exists and still has active
+    /// receivers; otherwise starts a new one (which also starts or reuses the
+    /// underlying telemetry tracker).
+    pub fn power_bounds(&mut self) -> broadcast::Receiver<Vec<Bounds<Power>>> {
+        if let Some(tx) = self.bounds_tx.as_ref().and_then(WeakCachingSender::upgrade)
+            && tx.receiver_count() > 0
+        {
+            return tx.subscribe_with_current();
+        }
+        let snapshot_rx = self.telemetry_snapshots();
+        let tx = CachingSender::<Vec<Bounds<Power>>>::new();
+        // Subscribe before spawning so the tracker sees a receiver and doesn't
+        // stop before this consumer has read anything.
+        let rx = tx.subscribe_with_current();
+        let tracker = PoolBoundsTracker::new(
+            snapshot_rx,
+            tx.clone(),
+            pool_bounds::compute_steam_boiler_pool_bounds::<metric::AcPowerActive>,
+            format!("{} steam boiler", metric::AcPowerActive::str_name()),
+        );
+        tokio::spawn(tracker.run());
+        self.bounds_tx = Some(tx.downgrade());
+        rx
+    }
+
     /// Returns a receiver for a stream of [`SteamBoilerPoolSnapshot`] values,
     /// each reflecting the latest boiler telemetry partitioned into healthy and
     /// unhealthy sets.
     ///
-    /// Reuses the running tracker if one exists and still has active receivers;
-    /// otherwise starts a new one.
+    /// Reuses the running tracker if one exists and still has active receivers
+    /// (including any held by a bounds tracker); otherwise starts a new one.
     pub fn telemetry_snapshots(&mut self) -> broadcast::Receiver<SteamBoilerPoolSnapshot> {
         if let Some(tx) = self
             .snapshot_tx
@@ -148,9 +210,11 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::SteamBoilerPool;
+    use crate::Bounds;
     use crate::client::proto::common::microgrid::electrical_components::ElectricalComponentStateCode;
     use crate::client::test_utils::MockComponent;
     use crate::microgrid::test_utils::{handles, last_snapshot};
+    use crate::quantity::Power;
 
     /// grid → meter → [boiler meter → steam_boiler(4), steam_boiler(5)],
     ///                 [chp meter → chp(7)]
@@ -219,6 +283,61 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn empty_pool_emits_empty_snapshot_and_bounds() {
+        // grid → meter, with no steam boilers anywhere.
+        let (client, lm) =
+            handles(MockComponent::grid(1).with_children(vec![MockComponent::meter(2)])).await;
+        let mut pool = SteamBoilerPool::try_new(None, client, lm).unwrap();
+
+        let mut snapshots = pool.telemetry_snapshots();
+        let mut bounds = pool.power_bounds();
+
+        let snapshot = last_snapshot(&mut snapshots, 5).await;
+        assert!(
+            snapshot.boilers.healthy.is_empty() && snapshot.boilers.unhealthy.is_empty(),
+            "empty pool snapshot should have no boilers, got {snapshot:?}"
+        );
+        assert!(
+            last_snapshot(&mut bounds, 5).await.is_empty(),
+            "empty pool should have empty power bounds"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reporting_boilers_are_healthy_and_their_bounds_add() {
+        // grid → meter → [steam_boiler(3), steam_boiler(4)], both reporting
+        // power with bounds 0..1000 W and 0..2000 W.
+        let (client, lm) = handles(MockComponent::grid(1).with_children(vec![
+            MockComponent::meter(2).with_children(vec![
+                MockComponent::steam_boiler(3)
+                    .with_power(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    .add_sample_power_bounds(Some(0.0), Some(1000.0)),
+                MockComponent::steam_boiler(4)
+                    .with_power(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    .add_sample_power_bounds(Some(0.0), Some(2000.0)),
+            ]),
+        ]))
+        .await;
+        let mut pool = SteamBoilerPool::try_new(None, client, lm).unwrap();
+
+        let mut snapshots = pool.telemetry_snapshots();
+        let mut bounds = pool.power_bounds();
+
+        let snap = last_snapshot(&mut snapshots, 10).await;
+        assert!(snap.boilers.healthy.contains_key(&3));
+        assert!(snap.boilers.healthy.contains_key(&4));
+        assert!(snap.boilers.unhealthy.is_empty());
+
+        assert_eq!(
+            last_snapshot(&mut bounds, 5).await,
+            vec![Bounds::new(
+                Some(Power::from_watts(0.0)),
+                Some(Power::from_watts(3000.0))
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn standby_boiler_is_unhealthy() {
         // Standby is healthy for a PV inverter but not for a steam boiler.
         let (client, lm) = handles(MockComponent::grid(1).with_children(vec![
@@ -261,5 +380,23 @@ mod tests {
 
         assert!(snap.boilers.healthy.contains_key(&3), "got {snap:?}");
         assert!(snap.boilers.unhealthy.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calling_power_bounds_twice_reuses_the_tracker() {
+        let (client, lm) = handles(graph()).await;
+        let mut pool = SteamBoilerPool::try_new(None, client, lm).unwrap();
+
+        let mut rx1 = pool.power_bounds();
+        let bounds1 = last_snapshot(&mut rx1, 10).await;
+
+        // A second call while rx1 is alive must reuse the running tracker,
+        // which re-sends its cached bounds at once; a fresh tracker's cache
+        // would be empty until it ran.
+        let mut rx2 = pool.power_bounds();
+        let bounds2 = rx2
+            .try_recv()
+            .expect("reused tracker should re-send its cached bounds immediately");
+        assert_eq!(bounds1, bounds2);
     }
 }
