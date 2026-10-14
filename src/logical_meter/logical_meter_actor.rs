@@ -58,6 +58,9 @@ struct ResampledStream {
 
 struct ComponentSubscription {
     feed: Feed,
+    /// Consecutive ticks on which no formula read this component, counted once
+    /// the subscription is attached.
+    idle_ticks: u32,
 }
 
 /// A subscribe request in flight, yielding the key it was sent for together
@@ -343,7 +346,8 @@ impl<C: Clock> LogicalMeterActor<C> {
     }
 
     /// Starts subscriptions for keys that were read but have no subscription,
-    /// and drops attached subscriptions that were not read.
+    /// and drops attached subscriptions that have gone unread for
+    /// `unsubscribe_after_idle_intervals` ticks.
     ///
     /// A pending subscription is never dropped, so at most one subscribe
     /// request is in flight per key.
@@ -354,12 +358,21 @@ impl<C: Clock> LogicalMeterActor<C> {
         subscribe_requests: &mut FuturesUnordered<SubscribeRequest>,
     ) {
         self.start_missing_subscriptions(used, subscriptions, subscribe_requests);
+        let limit = self.config.unsubscribe_after_idle_intervals;
         subscriptions.retain(|key, subscription| {
-            if used.contains(key) || matches!(subscription.feed, Feed::Pending) {
+            if used.contains(key) {
+                subscription.idle_ticks = 0;
                 return true;
             }
-            tracing::debug!("Dropping subscription of unread component {key}");
-            false
+            if matches!(subscription.feed, Feed::Pending) {
+                return true;
+            }
+            subscription.idle_ticks += 1;
+            if subscription.idle_ticks >= limit {
+                tracing::debug!("Dropping subscription of unread component {key}");
+                return false;
+            }
+            true
         });
     }
 
@@ -377,6 +390,7 @@ impl<C: Clock> LogicalMeterActor<C> {
             };
             entry.insert(ComponentSubscription {
                 feed: Feed::Pending,
+                idle_ticks: 0,
             });
             tracing::debug!("Subscribing to {key}");
             let client = self.client.clone();
@@ -593,7 +607,10 @@ mod tests {
 
     /// A subscription in state `feed`.
     fn subscription(feed: Feed) -> ComponentSubscription {
-        ComponentSubscription { feed }
+        ComponentSubscription {
+            feed,
+            idle_ticks: 0,
+        }
     }
 
     fn active_power_formula(formula: &str) -> engine::Formula<f32, Key> {
@@ -721,8 +738,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_subscriptions_drops_unread_keys() {
-        let actor = bare_actor();
+    async fn test_reconcile_subscriptions_ages_out_unread_keys() {
+        let limit = 2;
+        let actor = bare_actor_with(
+            LogicalMeterConfig::new(TimeDelta::try_seconds(1).unwrap())
+                .with_unsubscribe_after_idle_intervals(limit),
+        );
         let mut subscriptions = HashMap::new();
         for component_id in [2, 3] {
             let key = active_power_key(component_id);
@@ -742,12 +763,25 @@ mod tests {
         let used = HashSet::from([active_power_key(2)]);
         let mut subscribe_requests = FuturesUnordered::new();
 
+        // An unread key survives until it has gone unread for `limit`
+        // consecutive ticks.
+        for tick in 1..limit {
+            actor.reconcile_subscriptions(&used, &mut subscriptions, &mut subscribe_requests);
+            assert_eq!(subscriptions.len(), 3, "dropped too early on tick {tick}");
+        }
         actor.reconcile_subscriptions(&used, &mut subscriptions, &mut subscribe_requests);
 
         assert_eq!(subscriptions.len(), 2);
         assert!(subscriptions.contains_key(&active_power_key(2)));
-        // A pending subscription is never dropped.
+        assert_eq!(subscriptions[&active_power_key(2)].idle_ticks, 0);
+
+        // A pending subscription never ages out, and its idle ticks are not
+        // counted.
+        for _ in 0..limit {
+            actor.reconcile_subscriptions(&used, &mut subscriptions, &mut subscribe_requests);
+        }
         assert!(matches!(subscriptions[&pending_key].feed, Feed::Pending));
+        assert_eq!(subscriptions[&pending_key].idle_ticks, 0);
         assert!(
             subscribe_requests.is_empty(),
             "no subscription should start for an already-resampled key"
@@ -770,6 +804,49 @@ mod tests {
             "the receiver attaches only once the subscription completes"
         );
         assert_eq!(subscribe_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_subscriptions_resets_the_idle_count_on_a_read() {
+        let limit = 3;
+        let actor = bare_actor_with(
+            LogicalMeterConfig::new(TimeDelta::try_seconds(1).unwrap())
+                .with_unsubscribe_after_idle_intervals(limit),
+        );
+        let key = active_power_key(2);
+        let (_tx, receiver) = broadcast::channel(1);
+        let mut subscriptions = HashMap::from([(
+            key,
+            subscription(Feed::Live(actor.resampled_stream(
+                key.metric,
+                receiver,
+                actor.resampler_ts,
+            ))),
+        )]);
+        let mut subscribe_requests = FuturesUnordered::new();
+        let unread = HashSet::new();
+
+        for _ in 1..limit {
+            actor.reconcile_subscriptions(&unread, &mut subscriptions, &mut subscribe_requests);
+        }
+        // One read starts the count again.
+        actor.reconcile_subscriptions(
+            &HashSet::from([key]),
+            &mut subscriptions,
+            &mut subscribe_requests,
+        );
+        for tick in 1..limit {
+            actor.reconcile_subscriptions(&unread, &mut subscriptions, &mut subscribe_requests);
+            assert!(
+                subscriptions.contains_key(&key),
+                "dropped on unread tick {tick} after the read"
+            );
+        }
+        actor.reconcile_subscriptions(&unread, &mut subscriptions, &mut subscribe_requests);
+        assert!(
+            !subscriptions.contains_key(&key),
+            "not dropped after {limit} unread ticks in a row"
+        );
     }
 
     #[tokio::test]
@@ -1233,12 +1310,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_subscriptions_end_after_the_last_subscriber_drops() {
+    async fn test_subscriptions_age_out_after_the_last_subscriber_drops() {
         let interval = TimeDelta::try_seconds(1).unwrap();
         let (lm, open) = pv_chain_handle(
             MockComponent::pv_inverter(4).with_power(vec![10.0; 400]),
             MockComponent::meter(3).with_power(vec![1.0; 400]),
-            LogicalMeterConfig::new(interval),
+            LogicalMeterConfig::new(interval).with_unsubscribe_after_idle_intervals(2),
         )
         .await;
         let formula = lm.pv::<crate::metric::AcPowerActive>(None).unwrap();
@@ -1247,7 +1324,7 @@ mod tests {
         assert_eq!(open.lock().unwrap().ids(), BTreeSet::from([4]));
 
         drop(stream);
-        // Up to three resampling intervals of simulated time.
-        wait_for_open_streams(&open, BTreeSet::new(), interval.to_std().unwrap() / 5, 15).await;
+        // Up to six resampling intervals of simulated time.
+        wait_for_open_streams(&open, BTreeSet::new(), interval.to_std().unwrap() / 5, 30).await;
     }
 }
