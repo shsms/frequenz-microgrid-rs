@@ -163,6 +163,9 @@ pub struct MockComponent {
     /// How many attempts to start the telemetry stream fail before one
     /// succeeds. Set via [`MockComponent::with_failed_starts`].
     failed_starts: usize,
+    /// How long each failed start takes. Set via
+    /// [`MockComponent::with_failed_start_delay`].
+    failed_start_delay: std::time::Duration,
     /// Bounds attached to every streamed `AcPowerActive` sample. Set via
     /// [`MockComponent::add_sample_power_bounds`]; empty by default.
     sample_power_bounds: Vec<Bounds>,
@@ -401,6 +404,14 @@ impl MockComponent {
     /// `Unavailable`. Later attempts succeed.
     pub fn with_failed_starts(mut self, count: usize) -> Self {
         self.failed_starts = count;
+        self
+    }
+
+    /// Makes each failed start of the telemetry stream take `delay`, like a
+    /// connect attempt that times out.
+    #[cfg(test)]
+    pub(crate) fn with_failed_start_delay(mut self, delay: std::time::Duration) -> Self {
+        self.failed_start_delay = delay;
         self
     }
 }
@@ -657,7 +668,11 @@ impl MicrogridApiClient for MockMicrogridApiClient {
             .find(|c| c.component.id == comp_id)
             .cloned();
 
-        let failed_starts = component.as_ref().map_or(0, |c| c.failed_starts);
+        let (failed_starts, failed_start_delay) = component
+            .as_ref()
+            .map_or((0, std::time::Duration::ZERO), |c| {
+                (c.failed_starts, c.failed_start_delay)
+            });
         let attempts = {
             let mut start_attempts = self.start_attempts.lock().unwrap();
             let attempts = start_attempts.entry(comp_id).or_default();
@@ -665,6 +680,7 @@ impl MicrogridApiClient for MockMicrogridApiClient {
             *attempts
         };
         if attempts <= failed_starts {
+            tokio::time::sleep(failed_start_delay).await;
             return Err(tonic::Status::unavailable(format!(
                 "telemetry stream for {comp_id} failed to start"
             )));
