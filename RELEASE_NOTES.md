@@ -52,6 +52,7 @@ The logical meter now evaluates formulas once per resampling tick, against one s
 
 ## Bug Fixes
 
+- The microgrid client now stops its background task once every `MicrogridClientHandle` and every telemetry receiver from it is dropped. Until then, it keeps reconnecting telemetry streams that still have receivers. Before, once the last handle was dropped, the task used a full CPU core.
 - The microgrid client's telemetry stream retries hold up other requests for less time.
   - A telemetry stream that the service doesn't start within 10 seconds counts as failed and is retried. Before, a stream start that the service never answered held up other requests for good.
   - A round of retries starts no more streams once it has run for a second, and the next round comes a second later, so a waiting request gets a turn in between. Before, while the service couldn't be reached, retrying many failed streams could hold up other requests for one connection attempt per stream.
