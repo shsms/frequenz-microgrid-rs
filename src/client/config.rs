@@ -55,6 +55,11 @@ impl MicrogridClientConfig {
     /// other IP version starts 300 ms later, or when all addresses of the first
     /// version fail, with its own full time. A call that can't connect in time
     /// fails, and a telemetry stream retries later. It must be more than zero.
+    ///
+    /// A telemetry stream start gives up after 10 seconds, also when this
+    /// timeout is longer. A start can then give up before its connect attempt
+    /// does, and the next call can fail at once with that attempt's error. So
+    /// keep this timeout shorter than 10 seconds.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
@@ -84,8 +89,9 @@ impl MicrogridClientConfig {
     ///
     /// Without pings, a service that went away without closing the connection
     /// is not noticed while the client only waits for data, as a telemetry
-    /// stream does. A new call on that connection fails only when the operating
-    /// system gives up resending it, which can take many minutes.
+    /// stream does. A new list, bounds or set-power call on that connection
+    /// fails only when the operating system gives up resending it, which can
+    /// take many minutes.
     pub fn without_keep_alive(mut self) -> Self {
         self.keep_alive = None;
         self
