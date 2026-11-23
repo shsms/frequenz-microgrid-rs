@@ -14,13 +14,16 @@ const MAX_KEEP_ALIVE_DURATION: Duration = Duration::from_secs(3600);
 
 /// Settings for the connection to the microgrid API.
 ///
-/// The defaults are a connect timeout of 5 seconds, and an HTTP/2 keepalive
-/// ping after 60 seconds without data from the service. The connection closes
-/// if a ping gets no answer within 20 seconds.
+/// The defaults are a connect timeout of 5 seconds, a timeout of 10 seconds for
+/// list and bounds requests, and an HTTP/2 keepalive ping after 60 seconds
+/// without data from the service. The connection closes if a ping gets no
+/// answer within 20 seconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MicrogridClientConfig {
     /// How long to wait for the TCP connection to the service.
     pub(crate) connect_timeout: Duration,
+    /// How long to wait for the answer to a list or bounds request.
+    pub(crate) request_timeout: Duration,
     /// When to ping the service, and how long to wait for its answer, or `None`
     /// for no pings.
     pub(crate) keep_alive: Option<KeepAlive>,
@@ -39,6 +42,7 @@ impl Default for MicrogridClientConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(10),
             keep_alive: Some(KeepAlive {
                 interval: Duration::from_secs(60),
                 timeout: Duration::from_secs(20),
@@ -56,12 +60,36 @@ impl MicrogridClientConfig {
     /// version fail, with its own full time. A call that can't connect in time
     /// fails, and a telemetry stream retries later. It must be more than zero.
     ///
-    /// A telemetry stream start gives up after 10 seconds, also when this
-    /// timeout is longer. A start can then give up before its connect attempt
-    /// does, and the next call can fail at once with that attempt's error. So
-    /// keep this timeout shorter than 10 seconds.
+    /// A telemetry stream start gives up after 10 seconds, and a list or bounds
+    /// request after the request timeout, also when this timeout is longer. A
+    /// start or request can then give up before its connect attempt does, and
+    /// the next call can fail at once with that attempt's error. So keep this
+    /// timeout well under both. A connect attempt can also take the DNS lookup,
+    /// and up to 300 ms more when the other IP version takes over.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets how long to wait for the service to answer a request that lists
+    /// components or connections, or that augments bounds.
+    ///
+    /// The time includes connecting, if the client isn't connected yet. A
+    /// request that gets no answer in time fails with an
+    /// `ErrorKind::APIServerError`. The client handles these requests one at a
+    /// time, so a request that gets no answer holds up other requests for at
+    /// most this long. It must be more than zero.
+    ///
+    /// The time starts when the client starts the request, not when you call
+    /// the method. A request that waits behind other requests or telemetry
+    /// stream starts can take longer in total.
+    ///
+    /// Keep it well longer than the connect timeout. Otherwise a request can
+    /// give up before its connect attempt does, and the next call can fail at
+    /// once with that attempt's error. See [`Self::with_connect_timeout`] for
+    /// how long a connect attempt can take.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -89,9 +117,10 @@ impl MicrogridClientConfig {
     ///
     /// Without pings, a service that went away without closing the connection
     /// is not noticed while the client only waits for data, as a telemetry
-    /// stream does. A new list, bounds or set-power call on that connection
-    /// fails only when the operating system gives up resending it, which can
-    /// take many minutes.
+    /// stream does. A new set-power call on that connection fails only when the
+    /// operating system gives up resending it, which can take many minutes. A
+    /// list or bounds request fails after the request timeout, and so does
+    /// every later one, until the operating system gives up.
     pub fn without_keep_alive(mut self) -> Self {
         self.keep_alive = None;
         self
@@ -104,6 +133,12 @@ impl MicrogridClientConfig {
             return Err(Error::invalid_config(format!(
                 "connect_timeout must be positive, got {:?}",
                 self.connect_timeout
+            )));
+        }
+        if self.request_timeout.is_zero() {
+            return Err(Error::invalid_config(format!(
+                "request_timeout must be positive, got {:?}",
+                self.request_timeout
             )));
         }
         if let Some(KeepAlive { interval, timeout }) = self.keep_alive
@@ -281,26 +316,33 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_try_new_uses_the_default_keep_alive() {
-        let address = silent_server().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let handle = MicrogridClientHandle::try_new(format!("http://{address}"))
             .await
             .unwrap();
 
-        // With paused time, the clock jumps ahead while the call waits, so the
+        // A call makes the client connect. The call times out on its own, and
+        // the connection stays open until the default keepalive closes it.
+        // With paused time, the clock jumps ahead while the test waits, so the
         // default ping (after 60 s) and its timeout (20 s) pass at once.
+        let closed = async {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            while matches!(connection.read(&mut buffer).await, Ok(n) if n > 0) {}
+        };
         let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(200),
-            handle.list_electrical_components(vec![], vec![]),
-        )
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(90), async {
+            tokio::join!(handle.list_electrical_components(vec![], vec![]), closed)
+        })
         .await
         .expect("the default keepalive pings should close the silent connection");
 
-        assert!(result.is_err());
         assert!(
             start.elapsed() >= Duration::from_secs(80),
             "{:?}",
             start.elapsed()
         );
+        assert!(result.is_err());
     }
 }

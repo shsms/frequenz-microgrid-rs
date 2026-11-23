@@ -69,14 +69,33 @@ impl MicrogridClientHandle {
             Error::connection_failure(format!("Invalid microgrid API URL {url}: {e}"))
         })?;
         let channel = config.apply_to(endpoint).connect_lazy();
-        Ok(Self::new_from_client(MicrogridClient::<Channel>::new(
-            channel,
-        )))
+        Ok(Self::new_from_client_with_request_timeout(
+            MicrogridClient::<Channel>::new(channel),
+            config.request_timeout,
+        ))
     }
 
+    /// Creates a handle that sends its requests through `client`.
+    ///
+    /// List and bounds requests time out after the default request timeout of
+    /// [`MicrogridClientConfig`].
     pub fn new_from_client(client: impl MicrogridApiClient) -> Self {
+        Self::new_from_client_with_request_timeout(
+            client,
+            MicrogridClientConfig::default().request_timeout,
+        )
+    }
+
+    /// Creates a handle that sends its requests through `client`, and waits
+    /// `request_timeout` for the answer to a list or bounds request.
+    fn new_from_client_with_request_timeout(
+        client: impl MicrogridApiClient,
+        request_timeout: std::time::Duration,
+    ) -> Self {
         let (instructions_tx, instructions_rx) = mpsc::channel(100);
-        tokio::spawn(MicrogridClientActor::new_from_client(client, instructions_rx).run());
+        tokio::spawn(
+            MicrogridClientActor::new_from_client(client, instructions_rx, request_timeout).run(),
+        );
         Self { instructions_tx }
     }
 
@@ -123,7 +142,9 @@ impl MicrogridClientHandle {
     ///
     /// If a filter list is empty, then that filter is not applied.
     ///
-    /// A failed call to the service returns an
+    /// A failed call to the service, or one that gets no answer within the
+    /// request timeout (see [`MicrogridClientConfig::with_request_timeout`]),
+    /// returns an
     /// [`ErrorKind::APIServerError`](crate::ErrorKind::APIServerError).
     pub async fn list_electrical_components(
         &self,
@@ -164,7 +185,9 @@ impl MicrogridClientHandle {
     ///   AND
     /// * each `end` component ID is either `4`, `5`, OR `6`.
     ///
-    /// A failed call to the service returns an
+    /// A failed call to the service, or one that gets no answer within the
+    /// request timeout (see [`MicrogridClientConfig::with_request_timeout`]),
+    /// returns an
     /// [`ErrorKind::APIServerError`](crate::ErrorKind::APIServerError).
     pub async fn list_electrical_component_connections(
         &self,
@@ -230,6 +253,12 @@ impl MicrogridClientHandle {
     /// The bounds stay in effect for `request_lifetime`, rounded down to whole
     /// seconds. The API allows between 5 seconds and 15 minutes, and a negative
     /// lifetime is sent as 0 seconds. `None` uses the service's default.
+    ///
+    /// A failed call to the service, or one that gets no answer within the
+    /// request timeout (see [`MicrogridClientConfig::with_request_timeout`]),
+    /// returns an
+    /// [`ErrorKind::APIServerError`](crate::ErrorKind::APIServerError). The
+    /// service may still apply bounds from a request that timed out.
     pub async fn augment_electrical_component_bounds<M, I>(
         &self,
         electrical_component_id: u64,

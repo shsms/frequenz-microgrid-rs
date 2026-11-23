@@ -50,13 +50,20 @@ enum StreamStatus {
 pub(super) struct MicrogridClientActor<T> {
     client: T,
     instructions_rx: mpsc::Receiver<Instruction>,
+    /// How long to wait for the answer to a list or bounds request.
+    request_timeout: std::time::Duration,
 }
 
 impl<T: MicrogridApiClient> MicrogridClientActor<T> {
-    pub(super) fn new_from_client(client: T, instructions_rx: mpsc::Receiver<Instruction>) -> Self {
+    pub(super) fn new_from_client(
+        client: T,
+        instructions_rx: mpsc::Receiver<Instruction>,
+        request_timeout: std::time::Duration,
+    ) -> Self {
         Self {
             client,
             instructions_rx,
+            request_timeout,
         }
     }
 
@@ -92,6 +99,7 @@ impl<T: MicrogridApiClient> MicrogridClientActor<T> {
                         &mut components_to_retry,
                         instruction,
                         stream_status_tx.clone(),
+                        self.request_timeout,
                     ).await {
                         tracing::error!("MicrogridClientActor: Error handling instruction: {e}");
                     }
@@ -152,6 +160,7 @@ async fn handle_instruction<T: MicrogridApiClient>(
     components_to_retry: &mut HashMap<u64, tokio::time::Instant>,
     instruction: Instruction,
     stream_status_tx: mpsc::Sender<StreamStatus>,
+    request_timeout: std::time::Duration,
 ) -> Result<(), Error> {
     match instruction {
         Instruction::ReceiveElectricalComponentTelemetryStream {
@@ -191,17 +200,19 @@ async fn handle_instruction<T: MicrogridApiClient>(
             electrical_component_ids,
             electrical_component_categories,
         } => {
-            let components = client
-                .list_electrical_components(ListElectricalComponentsRequest {
+            let components = call_with_timeout(
+                "list_components",
+                request_timeout,
+                client.list_electrical_components(ListElectricalComponentsRequest {
                     electrical_component_ids,
                     electrical_component_categories: electrical_component_categories
                         .into_iter()
                         .map(|c| c as i32)
                         .collect(),
-                })
-                .await
-                .map_err(|e| Error::api_server_error(format!("list_components failed: {e}")))
-                .map(|r| r.into_inner().electrical_components);
+                }),
+            )
+            .await
+            .map(|r| r.electrical_components);
 
             response_tx
                 .send(components)
@@ -212,14 +223,18 @@ async fn handle_instruction<T: MicrogridApiClient>(
             source_electrical_component_ids,
             destination_electrical_component_ids,
         } => {
-            let connections = client
-                .list_electrical_component_connections(ListElectricalComponentConnectionsRequest {
-                    source_electrical_component_ids,
-                    destination_electrical_component_ids,
-                })
-                .await
-                .map_err(|e| Error::api_server_error(format!("list_connections failed: {e}")))
-                .map(|r| r.into_inner().electrical_component_connections);
+            let connections = call_with_timeout(
+                "list_connections",
+                request_timeout,
+                client.list_electrical_component_connections(
+                    ListElectricalComponentConnectionsRequest {
+                        source_electrical_component_ids,
+                        destination_electrical_component_ids,
+                    },
+                ),
+            )
+            .await
+            .map(|r| r.electrical_component_connections);
 
             response_tx
                 .send(connections)
@@ -232,38 +247,35 @@ async fn handle_instruction<T: MicrogridApiClient>(
             request_lifetime,
             response_tx,
         } => {
-            let response = client
-                .augment_electrical_component_bounds(
+            let response = call_with_timeout(
+                "augment_electrical_component_bounds",
+                request_timeout,
+                client.augment_electrical_component_bounds(
                     crate::client::proto::microgrid::AugmentElectricalComponentBoundsRequest {
                         electrical_component_id,
                         target_metric: target_metric as i32,
                         bounds,
                         request_lifetime: time::request_lifetime_secs(request_lifetime),
                     },
-                )
-                .await
-                .map_err(|e| {
-                    Error::api_server_error(format!(
-                        "augment_electrical_component_bounds failed: {e}"
-                    ))
-                })
-                .map(|r| {
-                    r.into_inner()
-                        .valid_until_time
-                        .and_then(|t| match time::timestamp_to_datetime(t) {
-                            dt @ Some(_) => dt,
-                            None => {
-                                tracing::error!(
-                                    concat!(
-                                        "Received invalid valid_until_time in ",
-                                        "AugmentElectricalComponentBoundsResponse: {:?}"
-                                    ),
-                                    t
-                                );
-                                None
-                            }
-                        })
-                });
+                ),
+            )
+            .await
+            .map(|r| {
+                r.valid_until_time
+                    .and_then(|t| match time::timestamp_to_datetime(t) {
+                        dt @ Some(_) => dt,
+                        None => {
+                            tracing::error!(
+                                concat!(
+                                    "Received invalid valid_until_time in ",
+                                    "AugmentElectricalComponentBoundsResponse: {:?}"
+                                ),
+                                t
+                            );
+                            None
+                        }
+                    })
+            });
 
             response_tx
                 .send(response)
@@ -297,6 +309,28 @@ async fn handle_instruction<T: MicrogridApiClient>(
     }
 
     Ok(())
+}
+
+/// Waits at most `timeout` for `request` to complete, connecting included.
+/// `name` identifies the request in errors and logs.
+///
+/// Returns an `ErrorKind::APIServerError` error if the request fails, or if it
+/// gets no answer in time.
+async fn call_with_timeout<R>(
+    name: &str,
+    timeout: std::time::Duration,
+    request: impl Future<Output = Result<tonic::Response<R>, tonic::Status>>,
+) -> Result<R, Error> {
+    match tokio::time::timeout(timeout, request).await {
+        Ok(Ok(response)) => Ok(response.into_inner()),
+        Ok(Err(e)) => Err(Error::api_server_error(format!("{name} failed: {e}"))),
+        Err(_) => {
+            tracing::debug!(request = name, timeout = ?timeout, "Request got no answer in time");
+            Err(Error::api_server_error(format!(
+                "{name} got no answer within {timeout:?}"
+            )))
+        }
+    }
 }
 
 /// Runs a retry round on a tick of the retry timer: restarts or forgets the
