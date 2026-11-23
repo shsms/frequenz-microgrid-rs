@@ -197,6 +197,7 @@ mod tests {
         let config = MicrogridClientConfig::default();
 
         assert_eq!(config.connect_timeout, Duration::from_secs(5));
+        assert_eq!(config.request_timeout, Duration::from_secs(10));
         assert_eq!(
             config.keep_alive,
             Some(KeepAlive {
@@ -210,8 +211,10 @@ mod tests {
     fn test_builders() {
         let config = MicrogridClientConfig::default()
             .with_connect_timeout(Duration::from_secs(3))
+            .with_request_timeout(Duration::from_secs(7))
             .with_keep_alive(Duration::from_secs(5), Duration::from_secs(2));
         assert_eq!(config.connect_timeout, Duration::from_secs(3));
+        assert_eq!(config.request_timeout, Duration::from_secs(7));
         assert_eq!(
             config.keep_alive,
             Some(KeepAlive {
@@ -254,6 +257,7 @@ mod tests {
         let one = Duration::from_secs(1);
         for config in [
             MicrogridClientConfig::default().with_connect_timeout(zero),
+            MicrogridClientConfig::default().with_request_timeout(zero),
             MicrogridClientConfig::default().with_keep_alive(zero, one),
             MicrogridClientConfig::default().with_keep_alive(one, zero),
         ] {

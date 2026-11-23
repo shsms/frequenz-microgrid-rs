@@ -1095,6 +1095,55 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_unanswered_requests_time_out() {
+        // The server never answers these requests, so only the request timeout
+        // ends the wait, and the client then handles a request it answers.
+        let (address, _) = server_that_never_starts_streams().await;
+        let request_timeout = std::time::Duration::from_millis(500);
+        let config = crate::MicrogridClientConfig::default()
+            .with_connect_timeout(std::time::Duration::from_millis(100))
+            .with_request_timeout(request_timeout);
+        let client =
+            MicrogridClientHandle::try_new_with_config(format!("http://{address}"), config)
+                .await
+                .unwrap();
+        let start = std::time::Instant::now();
+
+        let connections = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_electrical_component_connections(vec![], vec![]),
+        )
+        .await
+        .expect("the connections request didn't time out");
+        assert_eq!(
+            connections.unwrap_err().kind(),
+            crate::ErrorKind::APIServerError
+        );
+        let bounds = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.augment_electrical_component_bounds(
+                2,
+                crate::metric::AcPowerActive,
+                Vec::<crate::Bounds<crate::quantity::Power>>::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the bounds request didn't time out");
+        assert_eq!(bounds.unwrap_err().kind(), crate::ErrorKind::APIServerError);
+        assert!(start.elapsed() >= 2 * request_timeout);
+
+        let components = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_electrical_components(vec![], vec![]),
+        )
+        .await
+        .expect("the components request waited behind the unanswered ones")
+        .unwrap();
+        assert!(components.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_silent_component_stream_closes_when_its_receiver_drops() {
         // One sample, then silence: no message arrives after the receiver is
